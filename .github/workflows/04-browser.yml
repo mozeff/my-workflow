@@ -111,7 +111,7 @@ jobs:
             local CANDIDATE
             while true; do
               CANDIDATE=$(generate_random_numeric_name)
-              if [ ! -d "pages/$CANDIDATE" ] && [ ! -d "/tmp/${CANDIDATE}" ]; then
+              if [ ! -d "pages/$CANDIDATE" ] && [ ! -f "pages/$CANDIDATE.zip" ] && [ ! -d "/tmp/${CANDIDATE}" ]; then
                 echo "$CANDIDATE"
                 return
               fi
@@ -221,18 +221,19 @@ jobs:
             echo "- Media downloaded: $MEDIA_COUNT"
           } > "$FOLDER/index.md"
 
+          # اصلاح browse.md برای اشاره به فایل zip به‌جای پوشه
           BROWSE_FILE="browse.md"
           if [[ ! -f "$BROWSE_FILE" ]]; then
             echo "# Browsed Websites" > "$BROWSE_FILE"
             echo "" >> "$BROWSE_FILE"
           fi
-          echo "- [$FOLDER_NAME]($FOLDER/index.md) — $MEDIA_COUNT media files" >> "$BROWSE_FILE"
+          echo "- [$FOLDER_NAME](./${FOLDER_NAME}.zip) — $MEDIA_COUNT media files (zip archive)" >> "$BROWSE_FILE"
 
           echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
 
           echo "Done: $MEDIA_COUNT media files saved."
 
-      - name: Create zip archive (with optional encryption)
+      - name: Create zip archive (with optional encryption) and remove folder
         if: success()
         env:
           ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
@@ -247,6 +248,8 @@ jobs:
               echo "No password provided – creating unencrypted ZIP."
               zip -qr "${FOLDER_NAME}.zip" "$FOLDER_NAME"
             fi
+            # حذف پوشهٔ اصلی؛ فقط فایل zip می‌ماند
+            rm -rf "$FOLDER_NAME"
           fi
           cd "$GITHUB_WORKSPACE"
 
@@ -255,6 +258,7 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+          # فقط فایل‌های مورد نیاز: پوشه pages (فقط حاوی فایل zip خواهد بود) و browse.md
           git add pages/ browse.md
           if git diff --staged --quiet; then
             echo "No changes to commit"
