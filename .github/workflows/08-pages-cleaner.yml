@@ -23,14 +23,14 @@ jobs:
           rm -rf pages
           mkdir pages
           cat > pages/README.md << 'EOF'
-# Pages
-
----
-
-The folder is empty. Start browsing websites using the available workflows to save pages here.
-
----
-EOF
+          # Pages
+          
+          ---
+          
+          The folder is empty. Start browsing websites using the available workflows to save pages here.
+          
+          ---
+          EOF
           echo "Pages folder cleaned and README.md added."
 
       - name: Commit and push changes
