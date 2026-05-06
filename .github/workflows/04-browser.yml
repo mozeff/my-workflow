@@ -28,16 +28,18 @@ jobs:
           npm init -y > /dev/null
           npm install puppeteer > /dev/null
 
-      - name: Create screenshot script
+      - name: Create screenshot & HTML extractor script
         run: |
           cat > screenshot.js << 'EOF'
           const puppeteer = require('puppeteer');
+          const fs = require('fs');
           const url = process.argv[2];
-          const outputPath = process.argv[3];
+          const screenshotPath = process.argv[3];
+          const htmlPath = process.argv[4];
 
           (async () => {
             const browser = await puppeteer.launch({
-              headless: 'new',
+              headless: true,  // use 'new' if your puppeteer version requires it
               args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             });
             const page = await browser.newPage();
@@ -45,10 +47,35 @@ jobs:
 
             try {
               await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-              await page.screenshot({ path: outputPath, fullPage: true });
+
+              // Optional: scroll to load lazy content
+              await page.evaluate(async () => {
+                await new Promise((resolve) => {
+                  let totalHeight = 0;
+                  const distance = 300;
+                  const timer = setInterval(() => {
+                    window.scrollBy(0, distance);
+                    totalHeight += distance;
+                    if (totalHeight >= document.body.scrollHeight) {
+                      clearInterval(timer);
+                      resolve();
+                    }
+                  }, 150);
+                });
+              });
+              // Wait a moment for lazy-loaded images/media
+              await page.waitForTimeout(2000);
+
+              // Screenshot
+              await page.screenshot({ path: screenshotPath, fullPage: true });
               console.log('Screenshot saved successfully');
+
+              // Get fully rendered HTML
+              const html = await page.content();
+              fs.writeFileSync(htmlPath, html);
+              console.log('Rendered HTML saved successfully');
             } catch (err) {
-              console.error('Screenshot error:', err.message);
+              console.error('Error:', err.message);
               process.exitCode = 1;
             } finally {
               await browser.close();
@@ -67,16 +94,14 @@ jobs:
             HTTPS_URL="https://$RAW_URL"
             if curl -fsL --connect-timeout 10 --max-time 30 -o /dev/null "$HTTPS_URL" 2>/dev/null; then
               URL="$HTTPS_URL"
-              echo "Using HTTPS: $URL"
             else
               URL="http://$RAW_URL"
-              echo "Falling back to HTTP: $URL"
             fi
           else
             URL="$RAW_URL"
           fi
 
-          # --- توابع برای تولید نام تصادفی عددی ---
+          # --- توابع تولید نام تصادفی عددی (بدون تغییر) ---
           generate_random_numeric_name() {
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
@@ -87,7 +112,6 @@ jobs:
             local CANDIDATE
             while true; do
               CANDIDATE=$(generate_random_numeric_name)
-              # بررسی عدم وجود پوشه در pages/
               if [ ! -d "pages/$CANDIDATE" ] && [ ! -d "/tmp/${CANDIDATE}" ]; then
                 echo "$CANDIDATE"
                 return
@@ -101,21 +125,25 @@ jobs:
           MEDIA_DIR="$FOLDER/media"
           mkdir -p "$FOLDER" "$MEDIA_DIR"
 
-          echo "Visiting $URL"
-          echo "Saving to $FOLDER"
+          # لاگ را فاقد URL واقعی می‌کنیم
+          echo "Processing session ID: $FOLDER_NAME"
 
-          # Download HTML page
-          curl -sSL -A "Mozilla/5.0" -o "$FOLDER/page.html" "$URL" || {
-            echo "Failed to download HTML, creating placeholder"
-            echo "<html><body>Failed to load $URL</body></html>" > "$FOLDER/page.html"
-          }
-
-          # Take screenshot (non-fatal)
+          # ------------------------------------------------------------
+          # Puppeteer steps (unchanged)
+          # ------------------------------------------------------------
           SCREENSHOT_OK=false
-          if node screenshot.js "$URL" "$FOLDER/screenshot.png"; then
+          HTML_OK=false
+
+          if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html"; then
             SCREENSHOT_OK=true
+            HTML_OK=true
+            echo "Puppeteer succeeded: Screenshot and rendered HTML saved."
           else
-            echo "Screenshot skipped or failed"
+            echo "Puppeteer failed. Falling back to curl for raw HTML."
+            curl -sSL -A "Mozilla/5.0" -o "$FOLDER/page.html" "$URL" || {
+              echo "Failed to download HTML, creating placeholder"
+              echo "<html><body>Failed to load $URL</body></html>" > "$FOLDER/page.html"
+            }
           fi
 
           # Extract all links (href and src)
@@ -124,7 +152,6 @@ jobs:
           # Media extensions to download
           MEDIA_EXT='png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|zip|rar|tar|gz|7z'
 
-          # Resolve absolute URLs and download media
           > "$FOLDER/media_links.txt"
           > "$FOLDER/other_links.txt"
           > "$FOLDER/downloaded_media.md"
@@ -150,7 +177,6 @@ jobs:
             if echo "$ext_lower" | grep -Eq "^($MEDIA_EXT)$"; then
               echo "Downloading: $ABS_URL"
               SAFE_NAME=$(basename "$link" | sed 's/[?#].*//; s/[^a-zA-Z0-9._-]/_/g')
-              # Avoid overwriting by prefixing with timestamp if needed
               [[ ! -f "$MEDIA_DIR/$SAFE_NAME" ]] || SAFE_NAME="dup_$(date +%s)_${SAFE_NAME}"
 
               if curl -sSL --retry 2 --max-time 60 -o "$MEDIA_DIR/$SAFE_NAME" "$ABS_URL"; then
@@ -172,10 +198,11 @@ jobs:
             fi
           done < "$FOLDER/all_links.txt"
 
-          # Create index.md with summary
+          # Create index.md **without exposing the original URL**
           MEDIA_COUNT=$(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l)
           {
-            echo "# Visited: $URL"
+            # به جای URL از شناسه تصادفی استفاده می‌کنیم
+            echo "# Session ID: $FOLDER_NAME"
             echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo ""
             if $SCREENSHOT_OK && [[ -f "$FOLDER/screenshot.png" ]]; then
@@ -183,8 +210,8 @@ jobs:
               echo "![Screenshot](./screenshot.png)"
               echo ""
             fi
-            echo "## Raw HTML"
-            echo "[page.html](./page.html)"
+            echo "## HTML Source"
+            echo "[page.html](./page.html)  ($(wc -c < "$FOLDER/page.html") bytes)"
             echo ""
             echo "## Downloaded Media ($MEDIA_COUNT files)"
             if [[ "$MEDIA_COUNT" -gt 0 ]]; then
@@ -205,26 +232,31 @@ jobs:
             echo "- Media downloaded: $MEDIA_COUNT"
           } > "$FOLDER/index.md"
 
-          # Update browse history file (with random numeric name)
+          # Update browse history file (only show session ID, not URL)
           BROWSE_FILE="browse.md"
           if [[ ! -f "$BROWSE_FILE" ]]; then
             echo "# Browsed Websites" > "$BROWSE_FILE"
             echo "" >> "$BROWSE_FILE"
           fi
-          echo "- [${FOLDER_NAME}]($FOLDER/index.md) — $MEDIA_COUNT media files — $URL" >> "$BROWSE_FILE"
+          echo "- [$FOLDER_NAME]($FOLDER/index.md) — $MEDIA_COUNT media files" >> "$BROWSE_FILE"
 
           # Save variable for later steps
           echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
 
           echo "Done: $MEDIA_COUNT media files saved."
 
-      - name: Create zip archive of the folder
+      - name: Create and encrypt zip archive of the folder
         if: success()
+        env:
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}   # نیاز به تعریف Secret در تنظیمات مخزن
         run: |
           FOLDER_NAME="${{ env.FOLDER_NAME }}"
           cd pages
           if [ -d "$FOLDER_NAME" ]; then
-            zip -qr "${FOLDER_NAME}.zip" "$FOLDER_NAME"
+            # رمزگذاری با zip -e و تأمین رمز از متغیر محیطی
+            zip -qr -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$FOLDER_NAME"
+            # اگر ترجیح می‌دهید فایل zip اصلی (بدون رمز) حذف شود، خط زیر را فعال کنید
+            # (اما معمولاً برای دسترسی راحت‌تر می‌توانید نگه دارید)
           fi
           cd "$GITHUB_WORKSPACE"
 
@@ -238,6 +270,7 @@ jobs:
             echo "No changes to commit"
             exit 0
           fi
-          git commit -m "[Browse] Saved visit to ${{ github.event.inputs.url }} [skip ci]"
+          # کامیت بدون افشای URL
+          git commit -m "[Browse] Snapshot ${{ env.FOLDER_NAME }} [skip ci]"
           git pull --rebase origin "${{ github.ref_name }}"
           git push origin HEAD:"${{ github.ref_name }}"
