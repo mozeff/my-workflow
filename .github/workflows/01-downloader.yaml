@@ -79,25 +79,25 @@ jobs:
 
           mkdir -p downloads tmp_downloads
 
-          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
-
-          get_random_word() {
-            echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"
+          # --- توابع جدید برای نام تصادفی عددی ---
+          generate_random_numeric_name() {
+            # تولید یک عدد تصادفی بلند (حدود ۱۰-۱۲ رقم)
+            local PART1=$(( RANDOM * 32768 + RANDOM ))
+            local PART2=$(( RANDOM * 32768 + RANDOM ))
+            echo "${PART1}${PART2}"
           }
 
-          get_unique_folder() {
-            local BASE_PATH="$1"
-            local NAME="$2"
-            if [ ! -d "$BASE_PATH/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then
-              echo "$NAME"
-              return
-            fi
-            local RANDOM_SUFFIX=$(get_random_word)
-            while [ -d "$BASE_PATH/${NAME}_${RANDOM_SUFFIX}" ] || [ -d "$BACKUP_DIR/${NAME}_${RANDOM_SUFFIX}" ]; do
-              RANDOM_SUFFIX=$(get_random_word)
+          get_unique_numeric_folder() {
+            local CANDIDATE
+            while true; do
+              CANDIDATE=$(generate_random_numeric_name)
+              if [ ! -d "$BACKUP_DIR/$CANDIDATE" ] && [ ! -d "downloads/$CANDIDATE" ]; then
+                echo "$CANDIDATE"
+                return
+              fi
             done
-            echo "${NAME}_${RANDOM_SUFFIX}"
           }
+          # --- پایان توابع جدید ---
 
           urlencode() {
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
@@ -107,8 +107,7 @@ jobs:
             local FILENAME="$1"
             local ERROR_MSG="$2"
             local URL="$3"
-            local BASENAME_NO_EXT="${FILENAME%.*}"
-            local FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BASENAME_NO_EXT")
+            local FOLDER_NAME=$(get_unique_numeric_folder)
             mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
             {
               echo "# ${FILENAME} - Download Failed"
@@ -234,8 +233,8 @@ jobs:
 
           if [ "$MODE" = "zip" ]; then
             if [ -n "$(ls -A tmp_downloads 2>/dev/null)" ]; then
-              ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S)"
-              FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$ARCHIVE_NAME")
+              FOLDER_NAME=$(get_unique_numeric_folder)
+              ARCHIVE_NAME="$FOLDER_NAME"
               mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
               echo "Creating zip archive in folder: $BACKUP_DIR/$FOLDER_NAME"
 
@@ -314,10 +313,7 @@ jobs:
               fi
 
               BASENAME=$(basename "$FILE")
-              BASENAME_NO_EXT="${BASENAME%.*}"
-              EXT="${BASENAME##*.}"
-
-              FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BASENAME_NO_EXT")
+              FOLDER_NAME=$(get_unique_numeric_folder)
               mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
 
               FOLDER_ENCODED=$(urlencode "${FOLDER_NAME}")
@@ -326,13 +322,13 @@ jobs:
                 echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB - splitting into ${SPLIT_THRESHOLD_MB}MB parts"
 
                 TEMP_NAME="file_$$"
-                cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+                cp "$FILE" "tmp_downloads/${TEMP_NAME}.${BASENAME##*.}"
 
                 cd tmp_downloads
                 if [ -n "$ZIP_PASSWORD" ]; then
-                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${BASENAME##*.}"
                 else
-                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${BASENAME##*.}"
                 fi
 
                 for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
@@ -343,7 +339,7 @@ jobs:
                   fi
                 done
 
-                rm -f "${TEMP_NAME}.${EXT}"
+                rm -f "${TEMP_NAME}.${BASENAME##*.}"
                 cd ..
 
                 PARTS_COUNT=$(ls "$BACKUP_DIR/${FOLDER_NAME}/"*.z* 2>/dev/null | wc -l)
@@ -377,7 +373,7 @@ jobs:
 
                 README_FILE="$BACKUP_DIR/${FOLDER_NAME}/README.md"
                 {
-                  printf '%s\n' "# ${BASENAME_NO_EXT}"
+                  printf '%s\n' "# ${FOLDER_NAME} (orig: ${BASENAME})"
                   printf '%s\n' ""
                   printf '%s\n' "---"
                   printf '%s\n' ""
@@ -434,7 +430,7 @@ jobs:
 
                 README_FILE="$BACKUP_DIR/${FOLDER_NAME}/README.md"
                 {
-                  printf '%s\n' "# ${BASENAME_NO_EXT}"
+                  printf '%s\n' "# ${FOLDER_NAME} (orig: ${BASENAME})"
                   printf '%s\n' ""
                   printf '%s\n' "---"
                   printf '%s\n' ""

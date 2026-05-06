@@ -23,14 +23,14 @@ jobs:
           rm -rf videos
           mkdir videos
           cat > videos/README.md << 'EOF'
-# Videos
-
----
-
-The folder is empty. Start downloading videos using the available workflows.
-
----
-EOF
+          # Videos
+          
+          ---
+          
+          The folder is empty. Start downloading videos using the available workflows.
+          
+          ---
+          EOF
           echo "Videos folder cleaned and README.md added."
 
       - name: Commit and push changes
