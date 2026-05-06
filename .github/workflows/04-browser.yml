@@ -1,4 +1,4 @@
-name: 🌐 4-Browse the Web
+name: 🌐 4-Browse the Web (with manual password)
 
 on:
   workflow_dispatch:
@@ -7,6 +7,11 @@ on:
         description: 'URL to visit'
         required: true
         type: string
+      zip_password:
+        description: 'Password for the encrypted ZIP (leave blank to skip encryption)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   browse:
@@ -39,7 +44,7 @@ jobs:
 
           (async () => {
             const browser = await puppeteer.launch({
-              headless: true,  // use 'new' if your puppeteer version requires it
+              headless: true,
               args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             });
             const page = await browser.newPage();
@@ -48,7 +53,6 @@ jobs:
             try {
               await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-              // Optional: scroll to load lazy content
               await page.evaluate(async () => {
                 await new Promise((resolve) => {
                   let totalHeight = 0;
@@ -63,14 +67,11 @@ jobs:
                   }, 150);
                 });
               });
-              // Wait a moment for lazy-loaded images/media
               await page.waitForTimeout(2000);
 
-              // Screenshot
               await page.screenshot({ path: screenshotPath, fullPage: true });
               console.log('Screenshot saved successfully');
 
-              // Get fully rendered HTML
               const html = await page.content();
               fs.writeFileSync(htmlPath, html);
               console.log('Rendered HTML saved successfully');
@@ -89,7 +90,6 @@ jobs:
           set -euo pipefail
           RAW_URL="${{ github.event.inputs.url }}"
 
-          # Normalize URL: add protocol if missing
           if [[ ! "$RAW_URL" =~ ^https?:// ]]; then
             HTTPS_URL="https://$RAW_URL"
             if curl -fsL --connect-timeout 10 --max-time 30 -o /dev/null "$HTTPS_URL" 2>/dev/null; then
@@ -101,7 +101,6 @@ jobs:
             URL="$RAW_URL"
           fi
 
-          # --- توابع تولید نام تصادفی عددی (بدون تغییر) ---
           generate_random_numeric_name() {
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
@@ -118,19 +117,14 @@ jobs:
               fi
             done
           }
-          # --- پایان توابع ---
 
           FOLDER_NAME=$(get_unique_numeric_folder)
           FOLDER="pages/$FOLDER_NAME"
           MEDIA_DIR="$FOLDER/media"
           mkdir -p "$FOLDER" "$MEDIA_DIR"
 
-          # لاگ را فاقد URL واقعی می‌کنیم
           echo "Processing session ID: $FOLDER_NAME"
 
-          # ------------------------------------------------------------
-          # Puppeteer steps (unchanged)
-          # ------------------------------------------------------------
           SCREENSHOT_OK=false
           HTML_OK=false
 
@@ -146,10 +140,8 @@ jobs:
             }
           fi
 
-          # Extract all links (href and src)
           grep -ohP '(?:href|src)="\K[^"]*' "$FOLDER/page.html" | sort -u > "$FOLDER/all_links.txt"
 
-          # Media extensions to download
           MEDIA_EXT='png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|zip|rar|tar|gz|7z'
 
           > "$FOLDER/media_links.txt"
@@ -162,7 +154,6 @@ jobs:
 
           while IFS= read -r link; do
             [[ -z "$link" || "$link" =~ ^# ]] && continue
-            # Resolve relative URLs
             if [[ "$link" =~ ^https?:// ]]; then
               ABS_URL="$link"
             elif [[ "$link" = /* ]]; then
@@ -198,10 +189,8 @@ jobs:
             fi
           done < "$FOLDER/all_links.txt"
 
-          # Create index.md **without exposing the original URL**
           MEDIA_COUNT=$(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l)
           {
-            # به جای URL از شناسه تصادفی استفاده می‌کنیم
             echo "# Session ID: $FOLDER_NAME"
             echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo ""
@@ -232,7 +221,6 @@ jobs:
             echo "- Media downloaded: $MEDIA_COUNT"
           } > "$FOLDER/index.md"
 
-          # Update browse history file (only show session ID, not URL)
           BROWSE_FILE="browse.md"
           if [[ ! -f "$BROWSE_FILE" ]]; then
             echo "# Browsed Websites" > "$BROWSE_FILE"
@@ -240,23 +228,25 @@ jobs:
           fi
           echo "- [$FOLDER_NAME]($FOLDER/index.md) — $MEDIA_COUNT media files" >> "$BROWSE_FILE"
 
-          # Save variable for later steps
           echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
 
           echo "Done: $MEDIA_COUNT media files saved."
 
-      - name: Create and encrypt zip archive of the folder
+      - name: Create zip archive (with optional encryption)
         if: success()
         env:
-          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}   # نیاز به تعریف Secret در تنظیمات مخزن
+          ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
         run: |
           FOLDER_NAME="${{ env.FOLDER_NAME }}"
           cd pages
           if [ -d "$FOLDER_NAME" ]; then
-            # رمزگذاری با zip -e و تأمین رمز از متغیر محیطی
-            zip -qr -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$FOLDER_NAME"
-            # اگر ترجیح می‌دهید فایل zip اصلی (بدون رمز) حذف شود، خط زیر را فعال کنید
-            # (اما معمولاً برای دسترسی راحت‌تر می‌توانید نگه دارید)
+            if [ -n "$ZIP_PASSWORD" ]; then
+              echo "Creating encrypted ZIP..."
+              zip -qr -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$FOLDER_NAME"
+            else
+              echo "No password provided – creating unencrypted ZIP."
+              zip -qr "${FOLDER_NAME}.zip" "$FOLDER_NAME"
+            fi
           fi
           cd "$GITHUB_WORKSPACE"
 
@@ -270,7 +260,6 @@ jobs:
             echo "No changes to commit"
             exit 0
           fi
-          # کامیت بدون افشای URL
           git commit -m "[Browse] Snapshot ${{ env.FOLDER_NAME }} [skip ci]"
           git pull --rebase origin "${{ github.ref_name }}"
           git push origin HEAD:"${{ github.ref_name }}"
