@@ -1,0 +1,4 @@
+//abs.twimg.com/favicons/twitter.3.ico
+https://abs.twimg.com/emoji/v2/svg/26a0.svg
+https://abs.twimg.com/responsive-web/client-web/icon-ios.77d25eba.png
+https://abs.twimg.com/responsive-web/client-web/icon-svg.ea5ff4aa.svg
