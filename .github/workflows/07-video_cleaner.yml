@@ -1,3 +1,38 @@
+name: 🗑 Clean Videos folder
+
+on:
+  workflow_dispatch:
+    inputs:
+      warning:
+        description: '⚠️ WARNING: This will DELETE the entire videos/ folder and recreate it. Only proceed if you are sure.'
+        required: false
+        default: 'Read this warning before proceeding'
+
+jobs:
+  clean-videos:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Recreate videos folder with README
+        run: |
+          rm -rf videos
+          mkdir videos
+          cat > videos/README.md << 'EOF'
+          # Videos
+          
+          ---
+          
+          The folder is empty. Start downloading videos using the available workflows.
+          
+          ---
+          EOF
+          echo "Videos folder cleaned and README.md added."
+
       - name: Commit and push changes
         run: |
           git config user.name "github-actions"

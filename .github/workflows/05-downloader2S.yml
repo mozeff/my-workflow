@@ -1,3 +1,91 @@
+name: 🎬 YouTube Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: 'YouTube video URL'
+        required: true
+        type: string
+      quality:
+        description: 'Video quality (best, 1080, 720, 480, audio)'
+        required: false
+        default: 'best'
+        type: string
+      password:
+        description: 'Password for 7z archives (optional)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  download-youtube:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Start Cloudflare WARP proxy
+        run: |
+          echo "Starting Cloudflare WARP container..."
+
+          docker network create warp-net 2>/dev/null || true
+
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          echo "Waiting for WARP to initialize (30 seconds)..."
+          sleep 30
+
+          echo "Checking WARP status..."
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP is active!"
+              echo "$RESULT"
+              break
+            else
+              echo "Attempt $i/10 - WARP not ready yet, waiting..."
+              sleep 10
+            fi
+          done
+
+          FINAL=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+          if echo "$FINAL" | grep -qE "warp=(on|plus)"; then
+            echo "WARP proxy is ready!"
+          else
+            echo "WARP might not be fully active, but continuing anyway..."
+            echo "Response: $FINAL"
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip ffmpeg zip p7zip-full curl jq bc unzip
+
+          # Deno (required by yt-dlp for n-challenge solving)
+          curl -fsSL https://deno.land/install.sh | sh
+          export DENO_INSTALL="$HOME/.deno"
+          export PATH="$DENO_INSTALL/bin:$PATH"
+          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
+          deno --version
+
+          pip3 install --upgrade yt-dlp
+
       - name: Download YouTube video
         run: |
           set -euo pipefail
@@ -260,3 +348,89 @@
           find "$BACKUP_DIR" -type f | head -50
           echo "===== Video info file ====="
           cat /tmp/video_info.txt
+
+      - name: Stop Cloudflare WARP container
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
+
+      - name: Commit and push files
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          echo "Preparing to commit YouTube download..."
+
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          BACKUP_FILE_COUNT=$(find "$BACKUP_DIR" -type f 2>/dev/null | wc -l)
+          echo "Files to push: $BACKUP_FILE_COUNT"
+
+          if [ "$BACKUP_FILE_COUNT" -eq 0 ]; then
+            echo "No files found, aborting push"
+            exit 1
+          fi
+
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          regenerate_master_readme() {
+            local MASTER_README="videos/README.md"
+            {
+              echo "# DOWNLOADED VIDEOS LIST :"
+              echo ""
+              echo "----"
+              echo ""
+            } > "$MASTER_README"
+
+            local VIDEO_EMOJIS=("🎬" "🎥" "📽️" "🎞️" "📺" "🎦" "🎭" "🎪" "🎯" "🎮" "🎵" "🎶" "🎸" "🎹" "🎤")
+            local NUM=0
+
+            for folder in videos/*/; do
+              [ -d "$folder" ] || continue
+              FOLDER_NAME=$(basename "$folder")
+              [ -f "$folder/README.md" ] || continue
+              NUM=$((NUM + 1))
+              local EMOJI="${VIDEO_EMOJIS[$RANDOM % ${#VIDEO_EMOJIS[@]}]}"
+              local FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+              local FOLDER_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/tree/${BRANCH}/videos/${FOLDER_ENCODED}"
+              printf -- "- %s - %s [%s](%s)\n" "$NUM" "$EMOJI" "$FOLDER_NAME" "$FOLDER_LINK" >> "$MASTER_README"
+            done
+          }
+
+          # Retry loop for push (up to 20 attempts)
+          for ((RETRY=1; RETRY<=20; RETRY++)); do
+            echo "Push attempt $RETRY/20"
+
+            git fetch origin "$BRANCH"
+            git reset --hard origin/"$BRANCH"
+            mkdir -p videos
+            cp -r "$BACKUP_DIR"/* videos/ 2>/dev/null || true
+
+            regenerate_master_readme
+            git add -A videos/
+
+            if git diff --cached --quiet; then
+              echo "No changes to push (files likely already exist)."
+              exit 0
+            fi
+
+            git commit -m "[YouTube] Add video [skip ci]"
+
+            if git push origin HEAD:"$BRANCH" 2>&1; then
+              echo "Push successful!"
+              exit 0
+            else
+              WAIT=$((3 + RANDOM % 10))
+              echo "Push failed, waiting ${WAIT}s before retry..."
+              sleep $WAIT
+            fi
+          done
+
+          echo "All push attempts failed."
+          exit 1
