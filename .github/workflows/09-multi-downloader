@@ -1,0 +1,144 @@
+name: 📸 Multi-URL Screenshot to Zip
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Space-separated list of URLs (e.g. https://example.com/page1 https://example.com/page2)'
+        required: true
+        type: string
+
+jobs:
+  screenshot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl zip
+
+      - name: Setup Node.js and Puppeteer
+        run: |
+          npm init -y > /dev/null
+          npm install puppeteer > /dev/null
+
+      - name: Create multi-screenshot script (JPEG compression)
+        run: |
+          cat > multi_screenshot.js << 'EOF'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+
+          const urlsInput = process.env.URLS || '';
+          const urls = urlsInput.split(/\s+/).filter(u => u.length > 0);
+          if (urls.length === 0) {
+            console.error('No URLs provided.');
+            process.exit(1);
+          }
+
+          const outputDir = process.env.OUTPUT_DIR || '/tmp/screenshots';
+          if (!fs.existsSync(outputDir)) {
+            fs.mkdirSync(outputDir, { recursive: true });
+          }
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            });
+            let successCount = 0;
+
+            for (let i = 0; i < urls.length; i++) {
+              const url = urls[i];
+              console.log(`[${i+1}/${urls.length}] Processing: ${url}`);
+              const page = await browser.newPage();
+              await page.setViewport({ width: 1280, height: 720 });
+              try {
+                await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+                // Scroll to trigger lazy loading (capture beyond viewport)
+                await page.evaluate(async () => {
+                  await new Promise((resolve) => {
+                    let totalHeight = 0;
+                    const distance = 300;
+                    const timer = setInterval(() => {
+                      window.scrollBy(0, distance);
+                      totalHeight += distance;
+                      if (totalHeight >= document.body.scrollHeight) {
+                        clearInterval(timer);
+                        resolve();
+                      }
+                    }, 150);
+                  });
+                });
+                await page.waitForTimeout(1000);
+
+                const index = String(i + 1).padStart(3, '0');
+                // Use JPEG with medium quality (75) to reduce file size without changing dimensions
+                const filePath = `${outputDir}/screenshot_${index}.jpg`;
+                await page.screenshot({
+                  path: filePath,
+                  fullPage: true,
+                  type: 'jpeg',
+                  quality: 75,
+                  // omit background to avoid unnecessary alpha channel (keeps white background)
+                  omitBackground: true
+                });
+                console.log(`  -> saved ${filePath}`);
+                successCount++;
+              } catch (err) {
+                console.error(`  -> failed: ${err.message}`);
+              } finally {
+                await page.close();
+              }
+            }
+
+            await browser.close();
+            console.log(`Done. ${successCount}/${urls.length} screenshots captured.`);
+            // Write a simple info file inside the folder
+            fs.writeFileSync(`${outputDir}/info.txt`, `Screenshots for: ${urls.join(', ')}\nCaptured: ${successCount}/${urls.length}\nFormat: JPEG (quality 75)`);
+          })();
+          EOF
+
+      - name: Take all screenshots
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+          OUTPUT_DIR: /tmp/screenshots
+        run: |
+          rm -rf /tmp/screenshots
+          mkdir -p /tmp/screenshots
+          node multi_screenshot.js
+
+      - name: Generate unique zip name and archive
+        id: zip
+        run: |
+          # Generate a unique random numeric folder name for the zip
+          PART1=$(( RANDOM * 32768 + RANDOM ))
+          PART2=$(( RANDOM * 32768 + RANDOM ))
+          ZIP_NAME="${PART1}${PART2}"
+          ZIP_FILE="screenshots/${ZIP_NAME}.zip"
+
+          mkdir -p screenshots
+          cd /tmp/screenshots
+          zip -qr "$GITHUB_WORKSPACE/$ZIP_FILE" .
+          cd "$GITHUB_WORKSPACE"
+          echo "ZIP_FILE=$ZIP_FILE" >> $GITHUB_ENV
+          echo "Created $ZIP_FILE"
+
+      - name: Commit and push zip
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add screenshots/*.zip
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "[Screenshot] Batch ${{ env.ZIP_FILE }} [skip ci]"
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push origin HEAD:"${{ github.ref_name }}"
