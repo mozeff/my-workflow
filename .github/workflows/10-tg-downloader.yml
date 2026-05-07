@@ -1,4 +1,4 @@
-name: TG Downloader
+name: 07-TG Downloader
 
 on:
   workflow_dispatch:

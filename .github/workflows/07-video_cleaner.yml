@@ -1,4 +1,4 @@
-name: 🗑 Clean Videos folder
+name: 🗑 09-Clean Videos folder
 
 on:
   workflow_dispatch:

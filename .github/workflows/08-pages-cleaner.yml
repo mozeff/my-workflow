@@ -1,4 +1,4 @@
-name: 🗑 Clean Pages folder
+name: 🗑 10-Clean Pages folder
 
 on:
   workflow_dispatch:

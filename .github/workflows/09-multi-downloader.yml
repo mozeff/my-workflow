@@ -1,4 +1,4 @@
-name: 📸 Multi-URL Browser
+name: 📸 08-Multi-URL Browser
 
 on:
   workflow_dispatch:
