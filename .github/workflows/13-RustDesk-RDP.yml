@@ -1,45 +1,31 @@
-name: 🖥️ Remote Desktop via Cloudflare (Secret Password)
+name: 🦀 دسکتاپ با RustDesk
 
 on:
   workflow_dispatch:
 
 jobs:
-  rdp:
+  rustdesk:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: نصب دسکتاپ و RDP
+      - name: نصب دسکتاپ و RustDesk
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xfce4 xfce4-goodies xrdp
-          sudo systemctl enable xrdp
-          echo "runner:${{ secrets.RDP_PASSWORD }}" | sudo chpasswd
-          sudo usermod -aG ssl-cert xrdp
-          sudo systemctl restart xrdp
+          sudo apt-get install -y -qq xfce4 xfce4-goodies
+          # دانلود آخرین نسخه RustDesk Server
+          wget -q https://github.com/rustdesk/rustdesk-server/releases/latest/download/rustdesk-server-linux-amd64.deb
+          sudo dpkg -i rustdesk-server-linux-amd64.deb
+          # تولید رمز تصادفی
+          PASS=$(openssl rand -base64 12)
+          echo "RUSTDESK_PASSWORD=$PASS" >> $GITHUB_ENV
+          sudo rustdesk-server --password "$PASS"
 
-      - name: دانلود cloudflared
+      - name: نمایش ID و رمز
         run: |
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/
-
-      - name: راه‌اندازی تونل Cloudflare
-        run: |
-          cloudflared tunnel --url rdp://localhost:3389 --no-autoupdate > cloudflare.log 2>&1 &
-          for i in {1..30}; do
-            if grep -q "https://.*\.trycloudflare\.com" cloudflare.log; then
-              break
-            fi
-            sleep 2
-          done
-          echo "🔗 آدرس اتصال:"
-          grep -o "https://[a-zA-Z0-9.-]*\.trycloudflare\.com" cloudflare.log || echo "تونل هنوز آماده نیست"
-          sleep infinity &
-          wait
-
-      - name: اطلاعات اتصال
-        if: always()
-        run: |
-          echo "👤 نام کاربری: runner"
-          echo "🔑 رمز عبور: مقدار ذخیره‌شده در RDP_PASSWORD (مخفی)"
+          echo "🔹 RustDesk ID:"
+          # ID از خروجی دستور بعدی
+          sudo rustdesk-server --id
+          echo "🔐 رمز عبور: $RUSTDESK_PASSWORD"
+          # زنده نگه داشتن جلسه
+          while true; do sleep 3600; done
