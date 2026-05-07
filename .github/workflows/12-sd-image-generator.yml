@@ -62,15 +62,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: stable-diffusion.cpp/build/sd
-          key: sd-cpp-build-${{ runner.os }}-v2   # نسخه کش را افزایش دادیم
+          key: sd-cpp-build-${{ runner.os }}-v3   # نسخه کش جدید برای بیلد تمیز
 
-      - name: ساخت sd.cpp (در صورت عدم کش)
+      - name: ساخت sd.cpp (با دریافت submodule)
         run: |
-          set -x   # نمایش دستورات برای دیباگ
+          set -x
           if [ ! -f stable-diffusion.cpp/build/sd ]; then
-            echo "Building stable-diffusion.cpp from source..."
-            git clone --depth 1 https://github.com/leejet/stable-diffusion.cpp
+            echo "Cloning stable-diffusion.cpp with submodules..."
+            git clone --depth 1 --recurse-submodules https://github.com/leejet/stable-diffusion.cpp
             cd stable-diffusion.cpp
+            # اطمینان از وجود فایل CMakeLists.txt در ggml
+            if [ ! -f ggml/CMakeLists.txt ]; then
+              echo "Submodule not fetched, trying manual init..."
+              git submodule update --init --recursive --depth 1
+            fi
             cmake -B build -DSD_CUBLAS=OFF
             cmake --build build --target sd -j$(nproc)
           else
