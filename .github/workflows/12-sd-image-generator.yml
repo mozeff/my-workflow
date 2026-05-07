@@ -53,25 +53,26 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: نصب ابزارهای ضروری
+      - name: نصب ابزارهای ضروری (از جمله libomp-dev)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential cmake curl zip
+          sudo apt-get install -y -qq build-essential cmake curl zip libomp-dev
 
-      - name: دانلود و کامپایل stable-diffusion.cpp (فقط یک‌بار)
+      - name: کش فایل اجرایی sd
         uses: actions/cache@v4
         with:
           path: stable-diffusion.cpp/build/sd
-          key: sd-cpp-build-${{ runner.os }}-v1
+          key: sd-cpp-build-${{ runner.os }}-v2   # نسخه کش را افزایش دادیم
 
       - name: ساخت sd.cpp (در صورت عدم کش)
         run: |
+          set -x   # نمایش دستورات برای دیباگ
           if [ ! -f stable-diffusion.cpp/build/sd ]; then
+            echo "Building stable-diffusion.cpp from source..."
             git clone --depth 1 https://github.com/leejet/stable-diffusion.cpp
             cd stable-diffusion.cpp
-            mkdir build && cd build
-            cmake .. -DSD_CUBLAS=OFF
-            make -j$(nproc) sd
+            cmake -B build -DSD_CUBLAS=OFF
+            cmake --build build --target sd -j$(nproc)
           else
             echo "sd binary already cached, skipping build"
           fi
@@ -93,7 +94,7 @@ jobs:
             echo "Model found in cache, skipping download"
           fi
 
-      - name: ساخت نام پوشه تصادفی (مانند ورک‌فلو مرورگر)
+      - name: ساخت نام پوشه تصادفی
         id: folder
         run: |
           generate_random_numeric_name() {
@@ -163,7 +164,6 @@ jobs:
           [اطلاعات فنی](./info.txt)
           INDEXEOF
 
-          # فهرست کلی پروژه
           IMAGES_LIST="images.md"
           if [ ! -f "$IMAGES_LIST" ]; then
             echo "# 🖼️ گزارش تصاویر تولیدشده" > "$IMAGES_LIST"
