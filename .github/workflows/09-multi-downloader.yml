@@ -71,7 +71,8 @@ jobs:
                   }, 150);
                 });
               });
-              await page.waitForTimeout(2000);
+              // ✅ جایگزین waitForTimeout برای سازگاری با تمام نسخه‌ها
+              await new Promise(resolve => setTimeout(resolve, 2000));
 
               await page.screenshot({ path: screenshotPath, fullPage: true });
               console.log('Screenshot saved successfully');
