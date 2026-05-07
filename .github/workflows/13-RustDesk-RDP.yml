@@ -12,75 +12,61 @@ jobs:
       - name: نصب محیط دسکتاپ و ابزارهای لازم
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xfce4 xfce4-goodies xvfb x11vnc jq curl
-          # jq و curl از قبل هستن، ولی نصبشون ضرری نداره
+          sudo apt-get install -y -qq xfce4 xfce4-goodies xvfb x11vnc jq curl wget
 
-      - name: دانلود و نصب کلاینت RustDesk (سه روش آبشاری)
+      # در صورت نیاز به SSH دستی روی رانر، کامنت این بخش را بردارید
+      # - name: تونل SSH اضطراری (tmate) - فقط برای دیباگ
+      #   uses: mxschmitt/action-tmate@v3
+      #   timeout-minutes: 15  # پس از ۱۵ دقیقه خودکار بسته می‌شود
+
+      - name: دانلود و نصب مقاوم کلاینت RustDesk
         run: |
-          echo "🔍 تلاش برای دانلود RustDesk (۳ روش)"
+          echo "🔍 دریافت آخرین نسخه RustDesk"
 
-          # ---- روش ۱: دریافت لینک مستقیم از API (دقیق‌ترین روش) ----
-          echo "→ روش ۱: دریافت لینک از API"
-          if RELEASE_JSON=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest); then
-            DEB_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("rustdesk-.*-x86_64\\.deb$")) | .browser_download_url' | head -1)
-            if [ -n "$DEB_URL" ]; then
-              echo "دانلود از: $DEB_URL"
-              wget -q "$DEB_URL" -O rustdesk.deb && sudo dpkg -i rustdesk.deb 2>/dev/null && echo "✅ روش ۱ موفق بود" && skip=1
-            fi
-          fi
-          [ -n "$skip" ] && sudo apt-get install -f -y -qq && exit 0
+          # دریافت اطلاعات آخرین ریلیز
+          RELEASE_JSON=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest)
 
-          # ---- روش ۲: استفاده از curl -LJO با redirect ----
-          echo "→ روش ۲: دانلود با curl -LJO"
-          curl -sLJO https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-x86_64.deb
-          DEB_FILE=$(ls rustdesk-*.deb 2>/dev/null | head -1)
-          if [ -f "$DEB_FILE" ]; then
-            sudo dpkg -i "$DEB_FILE" 2>/dev/null && echo "✅ روش ۲ موفق بود" && skip=2
-          fi
-          [ -n "$skip" ] && sudo apt-get install -f -y -qq && exit 0
-          rm -f rustdesk-*.deb
+          # تلاش برای یافتن فایل deb مناسب از assets
+          DEB_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("rustdesk-.*-x86_64\\.deb$")) | .browser_download_url' | head -1)
 
-          # ---- روش ۳: ساخت دستی آدرس از نام تگ (آخرین نسخه) ----
-          echo "→ روش ۳: ساخت لینک از شماره نسخه"
-          if [ -z "$RELEASE_JSON" ]; then
-            RELEASE_JSON=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest)
-          fi
-          TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
-          if [ -n "$TAG" ]; then
+          # اگر از assets پیدا نشد، با تگ نسخه لینک بساز
+          if [ -z "$DEB_URL" ]; then
+            TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
             VERSION="${TAG#v}"
-            DIRECT_URL="https://github.com/rustdesk/rustdesk/releases/download/${TAG}/rustdesk-${VERSION}-x86_64.deb"
-            echo "امتحان آدرس: $DIRECT_URL"
-            wget -q "$DIRECT_URL" -O rustdesk.deb && sudo dpkg -i rustdesk.deb 2>/dev/null && echo "✅ روش ۳ موفق بود" && skip=3
+            DEB_URL="https://github.com/rustdesk/rustdesk/releases/download/${TAG}/rustdesk-${VERSION}-x86_64.deb"
           fi
-          [ -n "$skip" ] && sudo apt-get install -f -y -qq && exit 0
 
-          echo "❌ هیچ یک از ۳ روش جواب نداد! workflow با شکست مواجه می‌شود."
-          exit 1
+          echo "📥 دانلود از: $DEB_URL"
+          wget -q "$DEB_URL" -O rustdesk.deb || { echo "❌ دانلود ناموفق"; exit 1; }
+
+          echo "📦 نصب با apt (مدیریت خودکار وابستگی‌ها)"
+          sudo apt install -y ./rustdesk.deb
+          echo "✅ نصب کامل شد"
 
       - name: راه‌اندازی نمایشگر مجازی و کلاینت RustDesk
         run: |
-          # ساخت رمز تصادفی
+          # ساخت رمز عبور تصادفی
           PASS=$(openssl rand -base64 12)
           echo "RUSTDESK_PASSWORD=$PASS" >> $GITHUB_ENV
 
-          # راه‌اندازی Xvfb روی دیسپلی :99
+          # صفحه‌نمایش مجازی
           export DISPLAY=:99
           Xvfb :99 -screen 0 1280x720x16 &
           sleep 2
 
-          # اجرای محیط دسکتاپ xfce4 در پس‌زمینه
+          # محیط دسکتاپ
           startxfce4 &
           sleep 5
 
-          # اجرای کلاینت RustDesk با تنظیم رمز عبور
+          # کلاینت RustDesk با رمز دائمی
           rustdesk --password "$PASS" &
           sleep 3
 
-          # نمایش آی‌دی و رمز
+          # نمایش مشخصات اتصال
           echo "🔹 RustDesk ID:"
           rustdesk --get-id
           echo "🔐 رمز عبور: $PASS"
-          echo "⏳ جلسه فعال است. با همین ID و رمز از راه دور متصل شوید."
+          echo "⏳ جلسه تا ۶ ساعت فعال است. با ID و رمز بالا از راه دور وصل شوید."
 
-          # زنده نگه داشتن session برای ۶ ساعت (یا تا پایان تایم‌اوت)
+          # زنده نگه‌داشتن رانر
           while true; do sleep 3600; done
