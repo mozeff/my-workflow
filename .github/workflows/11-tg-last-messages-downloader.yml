@@ -1,0 +1,150 @@
+name: ✈️ 09-TG Channel Last Messages
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'آدرس یا نام کاربری کانال تلگرام (مثلاً example_channel یا https://t.me/example)'
+        required: true
+      zip_option:
+        description: 'آیا خروجی فشرده شود؟'
+        required: true
+        type: choice
+        options:
+          - 'zip'
+          - 'no_zip'
+        default: 'zip'
+      password:
+        description: 'رمز فایل فشرده (اختیاری)'
+        required: false
+        default: ''
+      download_artifact:
+        description: 'فایل نهایی را برای دانلود آپلود کنم؟'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    env:
+      CH: ${{ github.event.inputs.channel }}
+      ZIP_OPTION: ${{ github.event.inputs.zip_option }}
+      PASSWORD: ${{ github.event.inputs.password }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install p7zip (if zip is chosen)
+        if: env.ZIP_OPTION == 'zip'
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+      - name: Install puppeteer-core
+        run: npm install puppeteer-core
+
+      - name: Extract channel username
+        id: channel_info
+        run: |
+          CLEAN=$(echo "$CH" | sed -E 's|https?://t\.me/||i' | sed 's/^@//' | sed 's|/.*||')
+          echo "slug=$CLEAN" >> $GITHUB_OUTPUT
+
+      - name: Fetch messages & screenshot
+        env:
+          CHANNEL: ${{ steps.channel_info.outputs.slug }}
+        run: |
+          cat > fetch.js << 'EOF'
+          const puppeteer = require('puppeteer-core');
+          const fs = require('fs');
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath: '/usr/bin/google-chrome',
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 3000 });
+            await page.goto(`https://t.me/s/${process.env.CHANNEL}`, {
+              waitUntil: 'networkidle0',
+              timeout: 60000
+            });
+            try {
+              await page.waitForSelector('.tgme_widget_message_wrap', { timeout: 10000 });
+            } catch {
+              console.error('No messages found or page blocked');
+              await browser.close();
+              process.exit(1);
+            }
+            const messages = await page.evaluate(() => {
+              const msgElements = document.querySelectorAll('.tgme_widget_message_wrap');
+              const msgs = [];
+              msgElements.forEach((el, i) => {
+                if (i >= 10) return;
+                const textEl = el.querySelector('.tgme_widget_message_text');
+                const dateEl = el.querySelector('.tgme_widget_message_date time');
+                const text = textEl ? textEl.innerText.trim() : '';
+                const date = dateEl ? dateEl.getAttribute('datetime') : '';
+                const dateLink = el.querySelector('a.tgme_widget_message_date');
+                const link = dateLink ? dateLink.href : '';
+                msgs.push({ date, text, link });
+              });
+              return msgs;
+            });
+            let txt = '';
+            messages.forEach((m, idx) => {
+              txt += `${idx+1}. ${m.date}\n${m.link}\n${m.text}\n\n`;
+            });
+            fs.writeFileSync('messages.txt', txt.trim());
+            await page.screenshot({ path: 'screenshot.png' });
+            await browser.close();
+          })();
+          EOF
+          node fetch.js
+
+      - name: Prepare output
+        id: prepare
+        run: |
+          PASS="$PASSWORD"
+          SLUG="${{ steps.channel_info.outputs.slug }}"
+          TS=$(date +%Y%m%d_%H%M%S)
+          DIR="channel_messages/${SLUG}_${TS}"
+          mkdir -p "$DIR"
+          if [ "$ZIP_OPTION" = "zip" ]; then
+            if [ -n "$PASS" ]; then
+              7z a -p"${PASS}" -mhe=on "${DIR}/output.7z" messages.txt screenshot.png
+            else
+              7z a "${DIR}/output.7z" messages.txt screenshot.png
+            fi
+            echo "output_file=output.7z" >> $GITHUB_OUTPUT
+          else
+            cp messages.txt screenshot.png "$DIR/"
+            echo "output_file=messages.txt, screenshot.png" >> $GITHUB_OUTPUT
+          fi
+          echo "dir=$DIR" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact (if download requested)
+        if: github.event.inputs.download_artifact == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: channel-messages-${{ steps.prepare.outputs.dir }}
+          path: ${{ steps.prepare.outputs.dir }}
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add -A channel_messages/
+          git commit -m "channel messages [skip ci]" || true
+          BRANCH="${GITHUB_REF_NAME}"
+          for i in 1 2 3 4 5; do
+            sleep $((2 + RANDOM % 5))
+            git fetch origin "$BRANCH" --quiet
+            git reset --hard origin/"$BRANCH"
+            git add -A channel_messages/
+            git commit -m "channel messages [skip ci]" || true
+          done
+          echo "Push failed"
+          exit 1
