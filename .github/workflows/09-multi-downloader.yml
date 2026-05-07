@@ -1,4 +1,4 @@
-name: 📸 Multi-URL Browser (with manual password)
+name: 📸 Multi-URL Browser
 
 on:
   workflow_dispatch:
