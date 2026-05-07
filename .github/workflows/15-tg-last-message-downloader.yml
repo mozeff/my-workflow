@@ -1,4 +1,4 @@
-name: ✈️ 09-TG Channel Last Messages
+name: 📥 Download Newest File from Telegram Channel
 
 on:
   workflow_dispatch:
@@ -37,8 +37,11 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install puppeteer-core
-        run: npm install puppeteer-core
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser
+          npm install puppeteer-core
 
       - name: Extract channel username
         id: channel_info
@@ -47,11 +50,12 @@ jobs:
           CLEAN=$(echo "$CH" | sed -E 's|https?://t\.me/||i' | sed 's/^@//' | sed 's|/.*||')
           echo "slug=$CLEAN" >> $GITHUB_OUTPUT
 
-      - name: Fetch messages & screenshot
+      - name: Find newest file & get download URL
+        id: file_url
         env:
           CHANNEL: ${{ steps.channel_info.outputs.slug }}
         run: |
-          cat > fetch.js << 'EOF'
+          cat > get_url.js << 'EOF'
           const puppeteer = require('puppeteer-core');
           const fs = require('fs');
 
@@ -61,7 +65,8 @@ jobs:
               args: ['--no-sandbox', '--disable-setuid-sandbox']
             });
             const page = await browser.newPage();
-            await page.setViewport({ width: 1280, height: 3000 });
+            await page.setViewport({ width: 1280, height: 800 });
+
             await page.goto(`https://t.me/s/${process.env.CHANNEL}`, {
               waitUntil: 'networkidle0',
               timeout: 60000
@@ -70,44 +75,46 @@ jobs:
             try {
               await page.waitForSelector('.tgme_widget_message_wrap', { timeout: 10000 });
             } catch {
-              console.error('No messages found or page blocked');
+              console.error('No messages found');
               await browser.close();
               process.exit(1);
             }
 
-            // استخراج ۱۰ پیام آخر (جدیدترین‌ها اول) با لینک معتبر
-            const messages = await page.evaluate(() => {
-              const msgElements = document.querySelectorAll('.tgme_widget_message_wrap');
-              const msgs = [];
-              msgElements.forEach((el, i) => {
-                if (i >= 10) return;
-                const textEl = el.querySelector('.tgme_widget_message_text');
-                const dateEl = el.querySelector('.tgme_widget_message_date time');
-                const text = textEl ? textEl.innerText.trim() : '';
-                const date = dateEl ? dateEl.getAttribute('datetime') : '';
+            // گرفتن اولین (جدیدترین) پیام دارای فایل
+            const downloadUrl = await page.evaluate(() => {
+              const msgWraps = Array.from(document.querySelectorAll('.tgme_widget_message_wrap'));
+              const firstDocWrap = msgWraps.find(el =>
+                el.querySelector('.tgme_widget_message_document_wrap')
+              );
+              if (!firstDocWrap) return null;
 
-                // لینک را از تگ <a> مربوط به تاریخ می‌گیریم (روش مطمئن)
-                const dateLink = el.querySelector('a.tgme_widget_message_date');
-                const link = dateLink ? dateLink.href : '';
-
-                msgs.push({ date, text, link });
-              });
-              return msgs;
+              const dataPost = firstDocWrap.getAttribute('data-post');
+              if (!dataPost) return null;
+              const parts = dataPost.split('/');
+              if (parts.length < 2) return null;
+              const msgId = parts[1];
+              return `https://t.me/${process.env.CHANNEL}/${msgId}?download=1`;
             });
 
-            // نوشتن در فایل
-            let txt = '';
-            messages.forEach((m, idx) => {
-              txt += `${idx+1}. ${m.date}\n${m.link}\n${m.text}\n\n`;
-            });
-            fs.writeFileSync('messages.txt', txt.trim());
+            if (!downloadUrl) {
+              console.error('No file attachment found in any message');
+              await browser.close();
+              process.exit(1);
+            }
 
-            // اسکرین‌شات
-            await page.screenshot({ path: 'screenshot.png' });
+            fs.writeFileSync('download_url.txt', downloadUrl);
             await browser.close();
           })();
           EOF
-          node fetch.js
+          node get_url.js
+          echo "url=$(cat download_url.txt)" >> $GITHUB_OUTPUT
+
+      - name: Download file
+        run: |
+          URL="${{ steps.file_url.outputs.url }}"
+          echo "Downloading $URL"
+          curl -L -O -J "$URL"
+          ls -la
 
       - name: Prepare output
         id: prepare
@@ -116,19 +123,20 @@ jobs:
           PASS="${{ github.event.inputs.password }}"
           SLUG="${{ steps.channel_info.outputs.slug }}"
           TS=$(date +%Y%m%d_%H%M%S)
-          DIR="channel_messages/${SLUG}_${TS}"
+          DIR="downloaded_files/${SLUG}_${TS}"
           mkdir -p "$DIR"
 
+          DOWNLOADED_FILE=$(ls -t | head -1)
           if [ "$ZIP_OPTION" = "zip" ]; then
             if [ -n "$PASS" ]; then
-              7z a -p"${PASS}" -mhe=on "${DIR}/output.7z" messages.txt screenshot.png
+              7z a -p"${PASS}" -mhe=on "${DIR}/file.7z" "$DOWNLOADED_FILE"
             else
-              7z a "${DIR}/output.7z" messages.txt screenshot.png
+              7z a "${DIR}/file.7z" "$DOWNLOADED_FILE"
             fi
-            echo "output_file=output.7z" >> $GITHUB_OUTPUT
+            echo "output_file=file.7z" >> $GITHUB_OUTPUT
           else
-            cp messages.txt screenshot.png "$DIR/"
-            echo "output_file=messages.txt, screenshot.png" >> $GITHUB_OUTPUT
+            mv "$DOWNLOADED_FILE" "$DIR/"
+            echo "output_file=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
           fi
           echo "dir=$DIR" >> $GITHUB_OUTPUT
 
@@ -136,8 +144,8 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add -A channel_messages/
-          git commit -m "channel messages [skip ci]" || true
+          git add -A downloaded_files/
+          git commit -m "Downloaded newest file from ${{ steps.channel_info.outputs.slug }} [skip ci]" || true
 
           BRANCH="${GITHUB_REF_NAME}"
           for i in 1 2 3 4 5; do
@@ -148,8 +156,8 @@ jobs:
             sleep $((2 + RANDOM % 5))
             git fetch origin "$BRANCH" --quiet
             git reset --hard origin/"$BRANCH"
-            git add -A channel_messages/
-            git commit -m "channel messages [skip ci]" || true
+            git add -A downloaded_files/
+            git commit -m "Downloaded newest file [skip ci]" || true
           done
           echo "Push failed"
           exit 1
