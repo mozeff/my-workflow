@@ -75,7 +75,7 @@ jobs:
               process.exit(1);
             }
 
-            // Extract last 10 messages (newest first) with links, no console log
+            // استخراج ۱۰ پیام آخر (جدیدترین‌ها اول) با لینک معتبر
             const messages = await page.evaluate(() => {
               const msgElements = document.querySelectorAll('.tgme_widget_message_wrap');
               const msgs = [];
@@ -85,21 +85,24 @@ jobs:
                 const dateEl = el.querySelector('.tgme_widget_message_date time');
                 const text = textEl ? textEl.innerText.trim() : '';
                 const date = dateEl ? dateEl.getAttribute('datetime') : '';
-                const postId = el.getAttribute('data-post');
-                const link = postId ? `https://t.me/${postId}` : '';
+
+                // لینک را از تگ <a> مربوط به تاریخ می‌گیریم (روش مطمئن)
+                const dateLink = el.querySelector('a.tgme_widget_message_date');
+                const link = dateLink ? dateLink.href : '';
+
                 msgs.push({ date, text, link });
               });
               return msgs;
             });
 
-            // Write messages.txt with links included
+            // نوشتن در فایل
             let txt = '';
             messages.forEach((m, idx) => {
               txt += `${idx+1}. ${m.date}\n${m.link}\n${m.text}\n\n`;
             });
             fs.writeFileSync('messages.txt', txt.trim());
 
-            // Take screenshot
+            // اسکرین‌شات
             await page.screenshot({ path: 'screenshot.png' });
             await browser.close();
           })();
