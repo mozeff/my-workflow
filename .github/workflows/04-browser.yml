@@ -44,7 +44,7 @@ jobs:
 
           (async () => {
             const browser = await puppeteer.launch({
-              headless: true,
+              headless: true,  // use 'new' if your puppeteer version requires it
               args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             });
             const page = await browser.newPage();
@@ -53,6 +53,7 @@ jobs:
             try {
               await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
+              // Optional: scroll to load lazy content
               await page.evaluate(async () => {
                 await new Promise((resolve) => {
                   let totalHeight = 0;
@@ -67,11 +68,14 @@ jobs:
                   }, 150);
                 });
               });
+              // Wait a moment for lazy-loaded images/media
               await page.waitForTimeout(2000);
 
+              // Screenshot
               await page.screenshot({ path: screenshotPath, fullPage: true });
               console.log('Screenshot saved successfully');
 
+              // Get fully rendered HTML
               const html = await page.content();
               fs.writeFileSync(htmlPath, html);
               console.log('Rendered HTML saved successfully');
@@ -101,6 +105,7 @@ jobs:
             URL="$RAW_URL"
           fi
 
+          # --- توابع تولید نام تصادفی عددی (بدون تغییر) ---
           generate_random_numeric_name() {
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
@@ -123,8 +128,12 @@ jobs:
           MEDIA_DIR="$FOLDER/media"
           mkdir -p "$FOLDER" "$MEDIA_DIR"
 
+          # لاگ را فاقد URL واقعی می‌کنیم
           echo "Processing session ID: $FOLDER_NAME"
 
+          # ------------------------------------------------------------
+          # Puppeteer steps (unchanged)
+          # ------------------------------------------------------------
           SCREENSHOT_OK=false
           HTML_OK=false
 
@@ -189,8 +198,10 @@ jobs:
             fi
           done < "$FOLDER/all_links.txt"
 
+          # Create index.md **without exposing the original URL**
           MEDIA_COUNT=$(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l)
           {
+            # به جای URL از شناسه تصادفی استفاده می‌کنیم
             echo "# Session ID: $FOLDER_NAME"
             echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo ""
@@ -227,7 +238,7 @@ jobs:
             echo "# Browsed Websites" > "$BROWSE_FILE"
             echo "" >> "$BROWSE_FILE"
           fi
-          echo "- [$FOLDER_NAME](./${FOLDER_NAME}.zip) — $MEDIA_COUNT media files (zip archive)" >> "$BROWSE_FILE"
+          echo "- [$FOLDER_NAME](./pages/${FOLDER_NAME}.zip) — $MEDIA_COUNT media files (zip archive)" >> "$BROWSE_FILE"
 
           echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
 
@@ -264,6 +275,7 @@ jobs:
             echo "No changes to commit"
             exit 0
           fi
+          # کامیت بدون افشای URL
           git commit -m "[Browse] Snapshot ${{ env.FOLDER_NAME }} [skip ci]"
           git pull --rebase origin "${{ github.ref_name }}"
           git push origin HEAD:"${{ github.ref_name }}"
