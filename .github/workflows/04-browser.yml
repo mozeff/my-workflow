@@ -1,4 +1,4 @@
-name: 🌐 4-Browse the Web (with manual password)
+name: 🌐 04-Browse the Web (with manual password)
 
 on:
   workflow_dispatch:

@@ -1,4 +1,4 @@
-name: 🎬 YouTube Downloader
+name: 🎬 05-YouTube Downloader-S
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       quality:
         description: 'Video quality (best, 1080, 720, 480, audio)'
         required: false
-        default: 'best'
+        default: '480'
         type: string
       password:
         description: 'Password for 7z archives (optional)'
