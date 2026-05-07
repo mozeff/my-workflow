@@ -9,23 +9,41 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: نصب دسکتاپ و RustDesk
+      - name: نصب محیط دسکتاپ و ابزارهای لازم
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xfce4 xfce4-goodies
-          # دانلود آخرین نسخه RustDesk Server
-          wget -q https://github.com/rustdesk/rustdesk-server/releases/latest/download/rustdesk-server-linux-amd64.deb
-          sudo dpkg -i rustdesk-server-linux-amd64.deb
-          # تولید رمز تصادفی
+          sudo apt-get install -y -qq xfce4 xfce4-goodies xvfb x11vnc  # x11vnc اختیاری
+
+      - name: دانلود و نصب کلاینت RustDesk
+        run: |
+          wget -q https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-x86_64.deb
+          sudo dpkg -i rustdesk-x86_64.deb
+          sudo apt-get install -f -y   # رفع وابستگی‌های احتمالی
+
+      - name: راه‌اندازی نمایشگر مجازی و کلاینت RustDesk
+        run: |
+          # ساخت رمز تصادفی
           PASS=$(openssl rand -base64 12)
           echo "RUSTDESK_PASSWORD=$PASS" >> $GITHUB_ENV
-          sudo rustdesk-server --password "$PASS"
 
-      - name: نمایش ID و رمز
-        run: |
+          # راه‌اندازی Xvfb روی دیسپلی :99
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x720x16 &
+          sleep 2
+
+          # اجرای محیط دسکتاپ xfce4 در پس‌زمینه
+          startxfce4 &
+          sleep 5
+
+          # اجرای کلاینت RustDesk بدون نیاز به GUI (حالت silent)
+          # تنظیم رمز عبور دائمی
+          rustdesk --password "$PASS" &
+          sleep 3
+
+          # نمایش ID کلاینت
           echo "🔹 RustDesk ID:"
-          # ID از خروجی دستور بعدی
-          sudo rustdesk-server --id
-          echo "🔐 رمز عبور: $RUSTDESK_PASSWORD"
-          # زنده نگه داشتن جلسه
+          rustdesk --get-id
+          echo "🔐 رمز عبور: $PASS"
+
+          # زنده نگه داشتن session
           while true; do sleep 3600; done
