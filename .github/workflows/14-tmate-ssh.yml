@@ -1,0 +1,15 @@
+name: 99-🖥️ SSH به رانر (فقط tmate)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  tmate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: راه‌اندازی تونل SSH با tmate
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: false
