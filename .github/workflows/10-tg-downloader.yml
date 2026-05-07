@@ -1,0 +1,195 @@
+name: TG Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_link:
+        description: 'Link'
+        required: true
+        type: string
+      password:
+        description: 'Password (optional)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq p7zip-full python3
+
+      - name: Resolve link
+        id: resolve
+        run: |
+          LINK="${{ github.event.inputs.telegram_link }}"
+          RAW_URL=""
+          FILE_NAME=""
+
+          RESP=$(curl -s --max-time 30 -X POST \
+            -H "User-Agent: Mozilla/5.0" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "telegram_link=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$LINK")" \
+            https://telegramdownloader.net/proxy.php 2>/dev/null || true)
+
+          if [ -n "$RESP" ]; then
+            RAW_URL=$(echo "$RESP" | jq -r '.data.data.link // empty')
+            FILE_NAME=$(echo "$RESP" | jq -r '.data.data.file_name // empty')
+          fi
+
+          if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
+            RESP2=$(curl -s --max-time 30 -X POST \
+              -H "User-Agent: Mozilla/5.0" \
+              -H "Content-Type: application/json" \
+              -d "{\"url\":\"$LINK\"}" \
+              https://api.tgsave.com/download 2>/dev/null || true)
+            if [ -n "$RESP2" ]; then
+              RAW_URL=$(echo "$RESP2" | jq -r '.url // .link // .download_url // empty')
+              FILE_NAME=$(echo "$RESP2" | jq -r '.filename // .file_name // .name // empty')
+            fi
+          fi
+
+          if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
+            PAGE=$(curl -sL --max-time 20 -H "User-Agent: TelegramBot" "$LINK" 2>/dev/null || true)
+            RAW_URL=$(echo "$PAGE" | grep -oP 'https://cdn[0-9]*\.telesco\.pe/file/[^"]+' | head -1 || true)
+            [ -z "$RAW_URL" ] && RAW_URL=$(echo "$PAGE" | grep -oP '(?<=content=")[^"]+\.(mp4|mov|avi|mkv|pdf|zip|rar|7z|jpg|jpeg|png|gif|mp3|m4a|wav|flac)[^"]*' | head -1 || true)
+            [ -n "$RAW_URL" ] && FILE_NAME=$(basename "$RAW_URL" | sed 's/[?#].*//')
+          fi
+
+          if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
+            echo "Link resolution failed"
+            exit 1
+          fi
+
+          ENCODED_URL=$(python3 -c "
+          import urllib.parse, sys
+          url = sys.argv[1]
+          if '?' in url:
+              p, r = url.split('?',1)
+              r = '?'+r
+          elif '#' in url:
+              p, r = url.split('#',1)
+              r = '#'+r
+          else:
+              p, r = url, ''
+          print(urllib.parse.quote(p, safe=':/@.-_~!\$&()*+,;=') + r)
+          " "$RAW_URL")
+
+          if [ -z "$FILE_NAME" ] || [ "$FILE_NAME" = "null" ]; then
+            FILE_NAME=$(python3 -c "
+            import urllib.parse, sys
+            url = sys.argv[1].split('?')[0].split('#')[0]
+            print(urllib.parse.unquote(url.split('/')[-1]))
+            " "$RAW_URL")
+            [ -z "$FILE_NAME" ] && FILE_NAME="tg_$(date +%s)"
+          else
+            FILE_NAME=$(echo "$FILE_NAME" | sed 's/[?#].*//')
+          fi
+
+          echo "download_url=$ENCODED_URL" >> $GITHUB_OUTPUT
+          echo "original_name=$FILE_NAME" >> $GITHUB_OUTPUT
+
+      - name: "Download & prepare"
+        id: download
+        run: |
+          URL="${{ steps.resolve.outputs.download_url }}"
+          ORIG="${{ steps.resolve.outputs.original_name }}"
+
+          sanitize() {
+            echo "$1" | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null | sed 's/ /-/g; s/　/-/g' | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g; s/^[._-]*//' | tr -s '-'
+          }
+          SAFE=$(sanitize "$ORIG")
+          [ -z "$SAFE" ] && SAFE="tg_$(date +%s).bin"
+
+          mkdir -p tmp
+          BASE="${SAFE%.*}"
+          EXT="${SAFE##*.}"
+          [ "$EXT" = "$SAFE" ] && EXT="bin"
+          FINAL="$SAFE"
+          i=1
+          while [ -f "tmp/$FINAL" ]; do
+            FINAL="${BASE}_${i}.${EXT}"
+            i=$((i+1))
+          done
+
+          CURL_ARGS=(-L --progress-bar --max-time 7200 --retry 5 --retry-delay 10 -H "User-Agent: Mozilla/5.0" -H "Referer: https://t.me/" -o "tmp/$FINAL")
+          curl "${CURL_ARGS[@]}" "$URL" || \
+          curl "${CURL_ARGS[@]}" --http1.1 "$URL" || \
+          wget -q --show-progress --timeout=7200 --tries=5 -U "Mozilla/5.0" --referer="https://t.me/" -O "tmp/$FINAL" "$URL" || {
+            echo "Download failed"
+            exit 1
+          }
+
+          SIZE=$(stat -c%s "tmp/$FINAL")
+          if [ "$SIZE" -lt 1024 ]; then
+            head -5 "tmp/$FINAL"
+            rm "tmp/$FINAL"
+            exit 1
+          fi
+
+          MB=$(python3 -c "print('{:.2f}'.format($SIZE/1048576))")
+          echo "file_size=$SIZE" >> $GITHUB_OUTPUT
+          echo "file_mb=$MB" >> $GITHUB_OUTPUT
+          echo "fname=$FINAL" >> $GITHUB_OUTPUT
+
+      - name: Package and push
+        run: |
+          FILE="tmp/${{ steps.download.outputs.fname }}"
+          SIZE=${{ steps.download.outputs.file_size }}
+          MB=${{ steps.download.outputs.file_mb }}
+          PASS="${{ github.event.inputs.password }}"
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          SAN_DIR=$(basename "$FILE" | sed 's/\.[^.]*$//')
+          mkdir -p "downloads/$SAN_DIR"
+
+          INT_MB=$(echo "$MB" | cut -d'.' -f1)
+          if [ "$INT_MB" -lt 45 ]; then SPLIT=0
+          elif [ "$INT_MB" -lt 500 ]; then SPLIT=45
+          elif [ "$INT_MB" -lt 2048 ]; then SPLIT=90
+          else SPLIT=190; fi
+
+          if [ "$SPLIT" -gt 0 ] && [ "$SIZE" -gt $((SPLIT*1048576)) ]; then
+            [ -n "$PASS" ] && OPTS="-p${PASS} -mhe=on" || OPTS=""
+            7z a -v${SPLIT}m $OPTS -mx=0 "downloads/$SAN_DIR/$SAN_DIR.7z" "$FILE"
+          elif [ -n "$PASS" ]; then
+            7z a -p"${PASS}" -mhe=on -mx=0 "downloads/$SAN_DIR/$SAN_DIR.7z" "$FILE"
+          else
+            EXT="${FILE##*.}"
+            cp "$FILE" "downloads/$SAN_DIR/$SAN_DIR.$EXT"
+          fi
+
+          rm -rf tmp
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add -A downloads/
+          git commit -m "tg download [skip ci]" || true
+
+          for i in 1 2 3 4 5; do
+            if timeout 120 git push origin HEAD:"$BRANCH"; then
+              echo "Push ok"
+              exit 0
+            fi
+            sleep $((2+RANDOM%5))
+            git fetch origin "$BRANCH" --quiet
+            git reset --hard origin/"$BRANCH"
+            git add -A downloads/
+            git commit -m "tg download [skip ci]" || true
+          done
+          echo "Push failed"
+          exit 1
