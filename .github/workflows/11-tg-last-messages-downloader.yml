@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: 'آدرس یا نام کاربری کانال تلگرام (مثلاً example_channel یا https://t.me/example)'
+        description: 'آدرس یا نام کاربری کانال تلگرام'
         required: true
       zip_option:
         description: 'آیا خروجی فشرده شود؟'
@@ -18,11 +18,6 @@ on:
         description: 'رمز فایل فشرده (اختیاری)'
         required: false
         default: ''
-      download_artifact:
-        description: 'فایل نهایی را برای دانلود آپلود کنم؟'
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   fetch:
@@ -124,13 +119,6 @@ jobs:
             echo "output_file=messages.txt, screenshot.png" >> $GITHUB_OUTPUT
           fi
           echo "dir=$DIR" >> $GITHUB_OUTPUT
-
-      - name: Upload artifact (if download requested)
-        if: github.event.inputs.download_artifact == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: channel-messages-${{ steps.prepare.outputs.dir }}
-          path: ${{ steps.prepare.outputs.dir }}
 
       - name: Commit and push
         run: |
