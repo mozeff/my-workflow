@@ -1,0 +1,11 @@
+/resource/img/favicon.ico
+/resource/img/icon.bluesky.light.png
+/resource/img/icon.email.16.png
+/resource/img/icon.fb.16.png
+/resource/img/icon.linkedin.16.png
+/resource/img/icon.mendeley.16.png
+/resource/img/icon.reddit.16.png
+/resource/img/logo-plos-footer.png
+/resource/img/logo-plos-full-color.svg
+/resource/img/orcid_16x16.png
+https://crossmark-cdn.crossref.org/widget/v2.0/logos/CROSSMARK_BW_horizontal.svg
