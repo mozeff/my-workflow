@@ -75,7 +75,7 @@ jobs:
               process.exit(1);
             }
 
-            // Extract last 10 messages (newest first) with links
+            // Extract last 10 messages (newest first) with links, no console log
             const messages = await page.evaluate(() => {
               const msgElements = document.querySelectorAll('.tgme_widget_message_wrap');
               const msgs = [];
@@ -85,18 +85,11 @@ jobs:
                 const dateEl = el.querySelector('.tgme_widget_message_date time');
                 const text = textEl ? textEl.innerText.trim() : '';
                 const date = dateEl ? dateEl.getAttribute('datetime') : '';
-                // Extract the link from data-post attribute
                 const postId = el.getAttribute('data-post');
                 const link = postId ? `https://t.me/${postId}` : '';
                 msgs.push({ date, text, link });
               });
               return msgs;
-            });
-
-            // Log links to console
-            console.log('Extracted message links:');
-            messages.forEach((m, idx) => {
-              console.log(`${idx+1}: ${m.link}`);
             });
 
             // Write messages.txt with links included
@@ -106,7 +99,7 @@ jobs:
             });
             fs.writeFileSync('messages.txt', txt.trim());
 
-            // Take screenshot (viewport only to capture top messages)
+            // Take screenshot
             await page.screenshot({ path: 'screenshot.png' });
             await browser.close();
           })();
