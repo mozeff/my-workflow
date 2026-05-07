@@ -1,0 +1,201 @@
+name: 🖼️ SD Image Generator (Cached)
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt (شرح تصویر)'
+        required: true
+        type: string
+      negative_prompt:
+        description: 'Negative prompt'
+        required: false
+        type: string
+        default: 'bad quality, blurry, ugly, distorted'
+      steps:
+        description: 'Sampling steps (هرچه بیشتر، کیفیت بالاتر ولی کندتر)'
+        required: false
+        type: number
+        default: 15
+      cfg_scale:
+        description: 'CFG scale'
+        required: false
+        type: number
+        default: 7.0
+      seed:
+        description: 'Seed (-1 برای تصادفی)'
+        required: false
+        type: number
+        default: -1
+      width:
+        description: 'عرض تصویر (باید مضرب ۶۴ باشد)'
+        required: false
+        type: number
+        default: 512
+      height:
+        description: 'طول تصویر (مضرب ۶۴)'
+        required: false
+        type: number
+        default: 512
+      zip_password:
+        description: 'رمز فایل ZIP (خالی = بدون رمز)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: نصب ابزارهای ضروری
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake curl zip
+
+      - name: دانلود و کامپایل stable-diffusion.cpp (فقط یک‌بار)
+        uses: actions/cache@v4
+        with:
+          path: stable-diffusion.cpp/build/sd
+          key: sd-cpp-build-${{ runner.os }}-v1
+
+      - name: ساخت sd.cpp (در صورت عدم کش)
+        run: |
+          if [ ! -f stable-diffusion.cpp/build/sd ]; then
+            git clone --depth 1 https://github.com/leejet/stable-diffusion.cpp
+            cd stable-diffusion.cpp
+            mkdir build && cd build
+            cmake .. -DSD_CUBLAS=OFF
+            make -j$(nproc) sd
+          else
+            echo "sd binary already cached, skipping build"
+          fi
+
+      - name: کش مدل quantized SD 1.5
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: sd-model-v1-5-q4_0
+
+      - name: دانلود مدل (فقط در صورت نبود در کش)
+        run: |
+          if [ ! -f models/sd-v1-5-q4_0.gguf ]; then
+            mkdir -p models
+            echo "Downloading model ( ~2GB )..."
+            curl -L -o models/sd-v1-5-q4_0.gguf \
+              "https://huggingface.co/leejet/stable-diffusion.cpp/resolve/main/sd-v1-5-q4_0.gguf"
+          else
+            echo "Model found in cache, skipping download"
+          fi
+
+      - name: ساخت نام پوشه تصادفی (مانند ورک‌فلو مرورگر)
+        id: folder
+        run: |
+          generate_random_numeric_name() {
+            local PART1=$(( RANDOM * 32768 + RANDOM ))
+            local PART2=$(( RANDOM * 32768 + RANDOM ))
+            echo "${PART1}${PART2}"
+          }
+          get_unique_numeric_folder() {
+            local CANDIDATE
+            while true; do
+              CANDIDATE=$(generate_random_numeric_name)
+              if [ ! -d "images/$CANDIDATE" ] && [ ! -f "images/$CANDIDATE.zip" ]; then
+                echo "$CANDIDATE"
+                return
+              fi
+            done
+          }
+          FOLDER_NAME=$(get_unique_numeric_folder)
+          echo "folder_name=$FOLDER_NAME" >> $GITHUB_OUTPUT
+          mkdir -p "images/$FOLDER_NAME"
+
+      - name: تولید تصویر با sd.cpp
+        env:
+          PROMPT: ${{ github.event.inputs.prompt }}
+          NEGATIVE: ${{ github.event.inputs.negative_prompt }}
+          STEPS: ${{ github.event.inputs.steps }}
+          CFG: ${{ github.event.inputs.cfg_scale }}
+          SEED: ${{ github.event.inputs.seed }}
+          W: ${{ github.event.inputs.width }}
+          H: ${{ github.event.inputs.height }}
+        run: |
+          FOLDER_NAME="${{ steps.folder.outputs.folder_name }}"
+          OUTPUT="images/$FOLDER_NAME/output.png"
+          MODEL="models/sd-v1-5-q4_0.gguf"
+
+          ./stable-diffusion.cpp/build/sd \
+            -m "$MODEL" \
+            -p "$PROMPT" \
+            -n "$NEGATIVE" \
+            --steps $STEPS \
+            --cfg-scale $CFG \
+            --seed $SEED \
+            -W $W -H $H \
+            -o "$OUTPUT"
+
+          # ذخیره متادیتا
+          echo "prompt: $PROMPT" > "images/$FOLDER_NAME/info.txt"
+          echo "negative: $NEGATIVE" >> "images/$FOLDER_NAME/info.txt"
+          echo "steps: $STEPS, cfg: $CFG, seed: $SEED" >> "images/$FOLDER_NAME/info.txt"
+          echo "size: ${W}x${H}" >> "images/$FOLDER_NAME/info.txt"
+
+      - name: ساخت index و بروزرسانی فهرست اصلی
+        run: |
+          FOLDER_NAME="${{ steps.folder.outputs.folder_name }}"
+          PROMPT="${{ github.event.inputs.prompt }}"
+
+          cat > "images/$FOLDER_NAME/index.md" << INDEXEOF
+          # 🎨 تصویر تولیدشده – Session $FOLDER_NAME
+
+          **Prompt:** $PROMPT  
+          **Negative:** ${{ github.event.inputs.negative_prompt }}  
+          **Steps:** ${{ github.event.inputs.steps }}, **CFG:** ${{ github.event.inputs.cfg_scale }}  
+          **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ![Generated Image](./output.png)
+
+          [اطلاعات فنی](./info.txt)
+          INDEXEOF
+
+          # فهرست کلی پروژه
+          IMAGES_LIST="images.md"
+          if [ ! -f "$IMAGES_LIST" ]; then
+            echo "# 🖼️ گزارش تصاویر تولیدشده" > "$IMAGES_LIST"
+            echo "" >> "$IMAGES_LIST"
+          fi
+          echo "- [$FOLDER_NAME](./images/${FOLDER_NAME}.zip) — \"$PROMPT\"" >> "$IMAGES_LIST"
+
+      - name: ایجاد ZIP (با رمز اختیاری) و حذف پوشه اصلی
+        env:
+          ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
+        run: |
+          cd images
+          FOLDER_NAME="${{ steps.folder.outputs.folder_name }}"
+          if [ -d "$FOLDER_NAME" ]; then
+            if [ -n "$ZIP_PASSWORD" ]; then
+              zip -qr -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$FOLDER_NAME"
+            else
+              zip -qr "${FOLDER_NAME}.zip" "$FOLDER_NAME"
+            fi
+            rm -rf "$FOLDER_NAME"
+          fi
+
+      - name: کامیت و Push نتیجه
+        if: success()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add images/*.zip images.md
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "[SD Gen] تصویر جدید: ${{ github.event.inputs.prompt }} [skip ci]"
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push origin HEAD:"${{ github.ref_name }}"

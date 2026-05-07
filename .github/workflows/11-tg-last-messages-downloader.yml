@@ -1,0 +1,151 @@
+name: TG Channel Last Messages
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Telegram channel (@username or link)'
+        required: true
+        type: string
+      zip_option:
+        description: 'Output type'
+        required: true
+        type: choice
+        options:
+          - zip
+          - unzip
+      password:
+        description: 'Zip password (optional)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install puppeteer-core
+        run: npm install puppeteer-core
+
+      - name: Extract channel username
+        id: channel_info
+        run: |
+          CH="${{ github.event.inputs.channel }}"
+          # Remove URL prefix and '@'
+          CLEAN=$(echo "$CH" | sed -E 's|https?://t\.me/||i' | sed 's/^@//' | sed 's|/.*||')
+          echo "slug=$CLEAN" >> $GITHUB_OUTPUT
+
+      - name: Fetch messages & screenshot
+        env:
+          CHANNEL: ${{ steps.channel_info.outputs.slug }}
+        run: |
+          cat > fetch.js << 'EOF'
+          const puppeteer = require('puppeteer-core');
+          const fs = require('fs');
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath: '/usr/bin/chromium-browser',
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 3000 });
+            await page.goto(`https://t.me/s/${process.env.CHANNEL}`, {
+              waitUntil: 'networkidle0',
+              timeout: 60000
+            });
+
+            try {
+              await page.waitForSelector('.tgme_widget_message_wrap', { timeout: 10000 });
+            } catch {
+              console.error('No messages found or page blocked');
+              await browser.close();
+              process.exit(1);
+            }
+
+            // Extract last 10 messages (newest first)
+            const messages = await page.evaluate(() => {
+              const msgElements = document.querySelectorAll('.tgme_widget_message_wrap');
+              const msgs = [];
+              msgElements.forEach((el, i) => {
+                if (i >= 10) return;
+                const textEl = el.querySelector('.tgme_widget_message_text');
+                const dateEl = el.querySelector('.tgme_widget_message_date time');
+                const text = textEl ? textEl.innerText.trim() : '';
+                const date = dateEl ? dateEl.getAttribute('datetime') : '';
+                msgs.push({ date, text });
+              });
+              return msgs;
+            });
+
+            // Write messages.txt
+            let txt = '';
+            messages.forEach((m, idx) => {
+              txt += `${idx+1}. ${m.date}\n${m.text}\n\n`;
+            });
+            fs.writeFileSync('messages.txt', txt.trim());
+
+            // Take screenshot (viewport only to capture top messages)
+            await page.screenshot({ path: 'screenshot.png' });
+            await browser.close();
+          })();
+          EOF
+          node fetch.js
+
+      - name: Prepare output
+        id: prepare
+        run: |
+          ZIP_OPTION="${{ github.event.inputs.zip_option }}"
+          PASS="${{ github.event.inputs.password }}"
+          SLUG="${{ steps.channel_info.outputs.slug }}"
+          TS=$(date +%Y%m%d_%H%M%S)
+          DIR="channel_messages/${SLUG}_${TS}"
+          mkdir -p "$DIR"
+
+          if [ "$ZIP_OPTION" = "zip" ]; then
+            if [ -n "$PASS" ]; then
+              7z a -p"${PASS}" -mhe=on "${DIR}/output.7z" messages.txt screenshot.png
+            else
+              7z a "${DIR}/output.7z" messages.txt screenshot.png
+            fi
+            echo "output_file=output.7z" >> $GITHUB_OUTPUT
+          else
+            cp messages.txt screenshot.png "$DIR/"
+            echo "output_file=messages.txt, screenshot.png" >> $GITHUB_OUTPUT
+          fi
+          echo "dir=$DIR" >> $GITHUB_OUTPUT
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add -A channel_messages/
+          git commit -m "channel messages [skip ci]" || true
+
+          BRANCH="${GITHUB_REF_NAME}"
+          for i in 1 2 3 4 5; do
+            if timeout 120 git push origin HEAD:"$BRANCH"; then
+              echo "Push successful"
+              exit 0
+            fi
+            sleep $((2 + RANDOM % 5))
+            git fetch origin "$BRANCH" --quiet
+            git reset --hard origin/"$BRANCH"
+            git add -A channel_messages/
+            git commit -m "channel messages [skip ci]" || true
+          done
+          echo "Push failed"
+          exit 1
