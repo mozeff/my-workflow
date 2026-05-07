@@ -1,0 +1,330 @@
+name: 📸 Multi-URL Browser (with manual password)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Space-separated list of URLs (e.g. https://example.com/page1 https://example.com/page2)'
+        required: true
+        type: string
+      zip_password:
+        description: 'Password for the encrypted ZIP (leave blank to skip encryption)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  browse:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl zip
+
+      - name: Setup Node.js and Puppeteer
+        run: |
+          npm init -y > /dev/null
+          npm install puppeteer > /dev/null
+
+      # ------------------------------------------------------------
+      # اسکریپت Puppeteer (شبیه نمونه‌ی Browse the Web)
+      # ------------------------------------------------------------
+      - name: Create screenshot & HTML extractor script
+        run: |
+          cat > screenshot.js << 'EOF'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+          const url = process.argv[2];
+          const screenshotPath = process.argv[3];
+          const htmlPath = process.argv[4];
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 720 });
+
+            try {
+              await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+              // اسکرول برای فعال‌سازی lazy loading
+              await page.evaluate(async () => {
+                await new Promise((resolve) => {
+                  let totalHeight = 0;
+                  const distance = 300;
+                  const timer = setInterval(() => {
+                    window.scrollBy(0, distance);
+                    totalHeight += distance;
+                    if (totalHeight >= document.body.scrollHeight) {
+                      clearInterval(timer);
+                      resolve();
+                    }
+                  }, 150);
+                });
+              });
+              await page.waitForTimeout(2000);
+
+              await page.screenshot({ path: screenshotPath, fullPage: true });
+              console.log('Screenshot saved successfully');
+
+              const html = await page.content();
+              fs.writeFileSync(htmlPath, html);
+              console.log('Rendered HTML saved successfully');
+            } catch (err) {
+              console.error('Error:', err.message);
+              process.exitCode = 1;
+            } finally {
+              await browser.close();
+            }
+          })();
+          EOF
+
+      # ------------------------------------------------------------
+      # توابع تولید نام تصادفی عددی
+      # ------------------------------------------------------------
+      - name: Process each URL and collect all data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # تبدیل ورودی URLs به آرایه
+          IFS=' ' read -ra URLS_ARRAY <<< "${{ github.event.inputs.urls }}"
+
+          if [ ${#URLS_ARRAY[@]} -eq 0 ]; then
+            echo "No URLs provided"
+            exit 1
+          fi
+
+          generate_random_numeric_name() {
+            local PART1=$(( RANDOM * 32768 + RANDOM ))
+            local PART2=$(( RANDOM * 32768 + RANDOM ))
+            echo "${PART1}${PART2}"
+          }
+
+          get_unique_numeric_folder() {
+            local CANDIDATE
+            while true; do
+              CANDIDATE=$(generate_random_numeric_name)
+              if [ ! -d "pages/$CANDIDATE" ] && [ ! -f "pages/$CANDIDATE.zip" ] && [ ! -d "/tmp/${CANDIDATE}" ]; then
+                echo "$CANDIDATE"
+                return
+              fi
+            done
+          }
+
+          # نام پوشه‌ی اصلی batch
+          BATCH_FOLDER=$(get_unique_numeric_folder)
+          BATCH_PATH="pages/$BATCH_FOLDER"
+          mkdir -p "$BATCH_PATH"
+
+          echo "Batch session ID: $BATCH_FOLDER"
+
+          TOTAL_URLS=${#URLS_ARRAY[@]}
+          TOTAL_MEDIA=0
+
+          # ایجاد یک index کلی برای batch
+          cat > "$BATCH_PATH/index.md" << INDEX_HEADER
+          # Batch Session: $BATCH_FOLDER
+          **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          **Number of URLs processed:** $TOTAL_URLS
+
+          ## Processed Sessions
+          INDEX_HEADER
+
+          # پردازش هر URL
+          for (( idx=0; idx<${TOTAL_URLS}; idx++ )); do
+            RAW_URL="${URLS_ARRAY[$idx]}"
+
+            # افزودن پروتکل در صورت نیاز – شبیه نمونه اصلی
+            if [[ ! "$RAW_URL" =~ ^https?:// ]]; then
+              HTTPS_URL="https://$RAW_URL"
+              if curl -fsL --connect-timeout 10 --max-time 30 -o /dev/null "$HTTPS_URL" 2>/dev/null; then
+                URL="$HTTPS_URL"
+              else
+                URL="http://$RAW_URL"
+              fi
+            else
+              URL="$RAW_URL"
+            fi
+
+            # نام پوشه‌ی مخصوص همین URL
+            URL_FOLDER=$(get_unique_numeric_folder)
+            FOLDER="$BATCH_PATH/$URL_FOLDER"
+            MEDIA_DIR="$FOLDER/media"
+            mkdir -p "$FOLDER" "$MEDIA_DIR"
+
+            echo "🔄 [$((idx+1))/$TOTAL_URLS] Processing session ID: $URL_FOLDER"
+
+            # اسکرین‌شات و HTML
+            SCREENSHOT_OK=false
+            if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html"; then
+              SCREENSHOT_OK=true
+              echo "  ✅ Puppeteer succeeded"
+            else
+              echo "  ⚠️ Puppeteer failed, falling back to curl for raw HTML"
+              curl -sSL -A "Mozilla/5.0" -o "$FOLDER/page.html" "$URL" || {
+                echo "  ❌ Could not download HTML, creating placeholder"
+                echo "<html><body>Failed to load URL</body></html>" > "$FOLDER/page.html"
+              }
+            fi
+
+            # استخراج لینک‌های موجود در HTML
+            grep -ohP '(?:href|src)="\K[^"]*' "$FOLDER/page.html" | sort -u > "$FOLDER/all_links.txt"
+
+            # فرمت‌های رسانه‌ای قابل دانلود
+            MEDIA_EXT='png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|zip|rar|tar|gz|7z'
+
+            > "$FOLDER/media_links.txt"
+            > "$FOLDER/other_links.txt"
+            > "$FOLDER/downloaded_media.md"
+            echo "## Downloaded Media Files" > "$FOLDER/downloaded_media.md"
+            echo "" >> "$FOLDER/downloaded_media.md"
+
+            BASE_PROTOCOL_DOMAIN="$(echo "$URL" | awk -F/ '{print $1"//"$3}')"
+
+            while IFS= read -r link; do
+              [[ -z "$link" || "$link" =~ ^# ]] && continue
+              if [[ "$link" =~ ^https?:// ]]; then
+                ABS_URL="$link"
+              elif [[ "$link" = /* ]]; then
+                ABS_URL="${BASE_PROTOCOL_DOMAIN}${link}"
+              else
+                ABS_URL="${BASE_PROTOCOL_DOMAIN}/${link}"
+              fi
+
+              ext="${link##*.}"
+              ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+
+              if echo "$ext_lower" | grep -Eq "^($MEDIA_EXT)$"; then
+                SAFE_NAME=$(basename "$link" | sed 's/[?#].*//; s/[^a-zA-Z0-9._-]/_/g')
+                [[ ! -f "$MEDIA_DIR/$SAFE_NAME" ]] || SAFE_NAME="dup_$(date +%s)_${SAFE_NAME}"
+
+                if curl -sSL --retry 2 --max-time 60 -o "$MEDIA_DIR/$SAFE_NAME" "$ABS_URL"; then
+                  SIZE=$(stat -c%s "$MEDIA_DIR/$SAFE_NAME" 2>/dev/null || echo 0)
+                  if [[ "$SIZE" -gt 0 ]]; then
+                    echo "$link" >> "$FOLDER/media_links.txt"
+                    if [[ "$ext_lower" =~ ^(png|jpg|jpeg|gif|svg|webp)$ ]]; then
+                      echo "![$SAFE_NAME](./media/$SAFE_NAME)" >> "$FOLDER/downloaded_media.md"
+                    else
+                      echo "- [$SAFE_NAME](./media/$SAFE_NAME) (${SIZE} bytes)" >> "$FOLDER/downloaded_media.md"
+                    fi
+                  fi
+                fi
+              else
+                echo "$link" >> "$FOLDER/other_links.txt"
+              fi
+            done < "$FOLDER/all_links.txt"
+
+            # ساخت index.md برای این URL (بدون افشای URL)
+            MEDIA_COUNT=$(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l)
+            {
+              echo "# Session ID: $URL_FOLDER"
+              echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+              echo ""
+              if $SCREENSHOT_OK && [[ -f "$FOLDER/screenshot.png" ]]; then
+                echo "## Screenshot"
+                echo "![Screenshot](./screenshot.png)"
+                echo ""
+              fi
+              echo "## HTML Source"
+              echo "[page.html](./page.html)  ($(wc -c < "$FOLDER/page.html") bytes)"
+              echo ""
+              echo "## Downloaded Media ($MEDIA_COUNT files)"
+              if [[ "$MEDIA_COUNT" -gt 0 ]]; then
+                cat "$FOLDER/downloaded_media.md"
+              else
+                echo "_No media files downloaded_"
+              fi
+              echo ""
+              echo "## Other Links"
+              if [[ -s "$FOLDER/other_links.txt" ]]; then
+                head -50 "$FOLDER/other_links.txt" | while IFS= read -r entry; do
+                  echo "- [$entry]($entry)"
+                done
+              fi
+              echo ""
+              echo "## Stats"
+              echo "- Links found: $(wc -l < "$FOLDER/all_links.txt")"
+              echo "- Media downloaded: $MEDIA_COUNT"
+            } > "$FOLDER/index.md"
+
+            # اضافه کردن به index کلی batch
+            echo "- **[$URL_FOLDER](./$URL_FOLDER/index.md)** — $MEDIA_COUNT media files" >> "$BATCH_PATH/index.md"
+
+            TOTAL_MEDIA=$((TOTAL_MEDIA + MEDIA_COUNT))
+          done
+
+          # پایان index batch
+          echo "" >> "$BATCH_PATH/index.md"
+          echo "## Overall Stats" >> "$BATCH_PATH/index.md"
+          echo "- Total URLs: $TOTAL_URLS" >> "$BATCH_PATH/index.md"
+          echo "- Total media files: $TOTAL_MEDIA" >> "$BATCH_PATH/index.md"
+
+          # ذخیره متغیرها برای مراحل بعد
+          echo "BATCH_FOLDER=$BATCH_FOLDER" >> $GITHUB_ENV
+          echo "TOTAL_URLS=$TOTAL_URLS" >> $GITHUB_ENV
+          echo "TOTAL_MEDIA=$TOTAL_MEDIA" >> $GITHUB_ENV
+
+          echo "✅ All URLs processed."
+
+      # ------------------------------------------------------------
+      # ایجاد ZIP (با رمز اختیاری) و حذف پوشه اصلی
+      # ------------------------------------------------------------
+      - name: Create zip archive (with optional encryption) and remove folder
+        if: success()
+        env:
+          ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
+        run: |
+          BATCH_FOLDER="${{ env.BATCH_FOLDER }}"
+          cd pages
+          if [ -d "$BATCH_FOLDER" ]; then
+            if [ -n "$ZIP_PASSWORD" ]; then
+              echo "🔐 Creating encrypted ZIP..."
+              zip -qr -P "$ZIP_PASSWORD" "${BATCH_FOLDER}.zip" "$BATCH_FOLDER"
+            else
+              echo "📦 Creating unencrypted ZIP..."
+              zip -qr "${BATCH_FOLDER}.zip" "$BATCH_FOLDER"
+            fi
+            rm -rf "$BATCH_FOLDER"
+          fi
+          cd "$GITHUB_WORKSPACE"
+
+      # ------------------------------------------------------------
+      # به‌روزرسانی browse.md و commit
+      # ------------------------------------------------------------
+      - name: Commit and push results
+        if: success()
+        run: |
+          BATCH_FOLDER="${{ env.BATCH_FOLDER }}"
+          TOTAL_URLS="${{ env.TOTAL_URLS }}"
+          TOTAL_MEDIA="${{ env.TOTAL_MEDIA }}"
+
+          # به‌روزرسانی browse.md (شبیه نمونه‌ی اصلی)
+          BROWSE_FILE="browse.md"
+          if [[ ! -f "$BROWSE_FILE" ]]; then
+            echo "# Browsed Websites" > "$BROWSE_FILE"
+            echo "" >> "$BROWSE_FILE"
+          fi
+          echo "- [Batch $BATCH_FOLDER](./pages/${BATCH_FOLDER}.zip) — $TOTAL_URLS URLs, $TOTAL_MEDIA media files" >> "$BROWSE_FILE"
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add pages/ browse.md
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "[Multi-Browse] Batch $BATCH_FOLDER [skip ci]"
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push origin HEAD:"${{ github.ref_name }}"

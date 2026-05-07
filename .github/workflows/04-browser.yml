@@ -7,6 +7,11 @@ on:
         description: 'URL to visit'
         required: true
         type: string
+      zip_password:
+        description: 'Password for the encrypted ZIP (leave blank to skip encryption)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   browse:
@@ -89,7 +94,6 @@ jobs:
           set -euo pipefail
           RAW_URL="${{ github.event.inputs.url }}"
 
-          # Normalize URL: add protocol if missing
           if [[ ! "$RAW_URL" =~ ^https?:// ]]; then
             HTTPS_URL="https://$RAW_URL"
             if curl -fsL --connect-timeout 10 --max-time 30 -o /dev/null "$HTTPS_URL" 2>/dev/null; then
@@ -112,13 +116,12 @@ jobs:
             local CANDIDATE
             while true; do
               CANDIDATE=$(generate_random_numeric_name)
-              if [ ! -d "pages/$CANDIDATE" ] && [ ! -d "/tmp/${CANDIDATE}" ]; then
+              if [ ! -d "pages/$CANDIDATE" ] && [ ! -f "pages/$CANDIDATE.zip" ] && [ ! -d "/tmp/${CANDIDATE}" ]; then
                 echo "$CANDIDATE"
                 return
               fi
             done
           }
-          # --- پایان توابع ---
 
           FOLDER_NAME=$(get_unique_numeric_folder)
           FOLDER="pages/$FOLDER_NAME"
@@ -146,10 +149,8 @@ jobs:
             }
           fi
 
-          # Extract all links (href and src)
           grep -ohP '(?:href|src)="\K[^"]*' "$FOLDER/page.html" | sort -u > "$FOLDER/all_links.txt"
 
-          # Media extensions to download
           MEDIA_EXT='png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|zip|rar|tar|gz|7z'
 
           > "$FOLDER/media_links.txt"
@@ -162,7 +163,6 @@ jobs:
 
           while IFS= read -r link; do
             [[ -z "$link" || "$link" =~ ^# ]] && continue
-            # Resolve relative URLs
             if [[ "$link" =~ ^https?:// ]]; then
               ABS_URL="$link"
             elif [[ "$link" = /* ]]; then
@@ -232,31 +232,35 @@ jobs:
             echo "- Media downloaded: $MEDIA_COUNT"
           } > "$FOLDER/index.md"
 
-          # Update browse history file (only show session ID, not URL)
+          # اصلاح browse.md برای اشاره به فایل zip به‌جای پوشه
           BROWSE_FILE="browse.md"
           if [[ ! -f "$BROWSE_FILE" ]]; then
             echo "# Browsed Websites" > "$BROWSE_FILE"
             echo "" >> "$BROWSE_FILE"
           fi
-          echo "- [$FOLDER_NAME]($FOLDER/index.md) — $MEDIA_COUNT media files" >> "$BROWSE_FILE"
+          echo "- [$FOLDER_NAME](./pages/${FOLDER_NAME}.zip) — $MEDIA_COUNT media files (zip archive)" >> "$BROWSE_FILE"
 
-          # Save variable for later steps
           echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
 
           echo "Done: $MEDIA_COUNT media files saved."
 
-      - name: Create and encrypt zip archive of the folder
+      - name: Create zip archive (with optional encryption) and remove folder
         if: success()
         env:
-          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}   # نیاز به تعریف Secret در تنظیمات مخزن
+          ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
         run: |
           FOLDER_NAME="${{ env.FOLDER_NAME }}"
           cd pages
           if [ -d "$FOLDER_NAME" ]; then
-            # رمزگذاری با zip -e و تأمین رمز از متغیر محیطی
-            zip -qr -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$FOLDER_NAME"
-            # اگر ترجیح می‌دهید فایل zip اصلی (بدون رمز) حذف شود، خط زیر را فعال کنید
-            # (اما معمولاً برای دسترسی راحت‌تر می‌توانید نگه دارید)
+            if [ -n "$ZIP_PASSWORD" ]; then
+              echo "Creating encrypted ZIP..."
+              zip -qr -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$FOLDER_NAME"
+            else
+              echo "No password provided – creating unencrypted ZIP."
+              zip -qr "${FOLDER_NAME}.zip" "$FOLDER_NAME"
+            fi
+            # حذف پوشهٔ اصلی؛ فقط فایل zip می‌ماند
+            rm -rf "$FOLDER_NAME"
           fi
           cd "$GITHUB_WORKSPACE"
 
@@ -265,6 +269,7 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+          # فقط فایل‌های مورد نیاز: پوشه pages (فقط حاوی فایل zip خواهد بود) و browse.md
           git add pages/ browse.md
           if git diff --staged --quiet; then
             echo "No changes to commit"

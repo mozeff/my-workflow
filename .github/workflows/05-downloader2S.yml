@@ -161,9 +161,54 @@ jobs:
           done
           
           if ! $DOWNLOAD_SUCCESS; then
-            echo "All download methods failed!"
+            echo "======= Download failed for the requested video ======="
+            echo "Trying to extract channel info and list first 50 videos..."
+            
+            # تابع کمکی برای استخراج آدرس کانال از ویدیوی شکست‌خورده
+            get_channel_url() {
+              # اول از channel_url مستقیم
+              local c_url
+              c_url=$(yt-dlp --no-download --print channel_url "$URL" 2>/dev/null || true)
+              if [ -n "$c_url" ]; then
+                echo "$c_url"
+                return
+              fi
+              # اگه نشد، از uploader_id استفاده می‌کنیم
+              local uploader
+              uploader=$(yt-dlp --no-download --print uploader_id "$URL" 2>/dev/null || true)
+              if [ -n "$uploader" ]; then
+                echo "https://www.youtube.com/@${uploader}/videos"
+                return
+              fi
+              # آخرین تلاش: شاید خودش channel یا user باشه
+              echo ""
+            }
+            
+            CHANNEL_URL=$(get_channel_url)
+            
+            if [ -z "$CHANNEL_URL" ]; then
+              echo "Could not determine channel URL. Exiting without list."
+              exit 1
+            fi
+            
+            echo "Channel URL: $CHANNEL_URL"
+            echo "First 50 videos from this channel:"
+            echo "----------------------------------"
+            
+            # خروجی ساده: عنوان و لینک
+            yt-dlp --flat-playlist --playlist-end 50 \
+              --print "%(title)s | %(webpage_url)s" \
+              "$CHANNEL_URL" 2>/dev/null || {
+              echo "Failed to list channel videos. Channel might be private or unavailable."
+            }
+            
+            echo "----------------------------------"
+            echo "Logging completed. Exiting with error because original download was not possible."
             exit 1
           fi
+          
+          # --- ادامهٔ بخش قبلی که فایل رو آماده‌سازی و پوش می‌کنه ---
+          # (بقیه کد بدون تغییر از اینجا به بعد میاد)
           
           find tmp_downloads -name "*.part" -delete
           echo "Download complete. Files:"
@@ -173,7 +218,6 @@ jobs:
           REPO_NAME="${{ github.event.repository.name }}"
           BRANCH="${GITHUB_REF_NAME}"
           
-          # --- توابع جدید برای نام تصادفی عددی ---
           generate_random_numeric_name() {
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
@@ -184,14 +228,12 @@ jobs:
             local CANDIDATE
             while true; do
               CANDIDATE=$(generate_random_numeric_name)
-              # بررسی عدم وجود پوشه در videos و backup
               if [ ! -d "videos/$CANDIDATE" ] && [ ! -d "$BACKUP_DIR/$CANDIDATE" ]; then
                 echo "$CANDIDATE"
                 return
               fi
             done
           }
-          # --- پایان توابع ---
           
           > /tmp/video_info.txt
           
@@ -234,7 +276,6 @@ jobs:
               done
               TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
               
-              # ساخت README بدون heredoc
               README_FILE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
               {
                 echo "# ${FILENAME_NO_EXT}"
