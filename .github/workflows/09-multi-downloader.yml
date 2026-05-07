@@ -12,6 +12,11 @@ on:
         required: false
         type: string
         default: ''
+      wait_seconds:
+        description: 'How many seconds to wait after scrolling to ensure full page load (default: 3)'
+        required: false
+        type: string
+        default: '3'
 
 jobs:
   browse:
@@ -44,6 +49,7 @@ jobs:
           const url = process.argv[2];
           const screenshotPath = process.argv[3];
           const htmlPath = process.argv[4];
+          const waitSeconds = parseFloat(process.argv[5]) || 3; // پیش‌فرض ۳ ثانیه
 
           (async () => {
             const browser = await puppeteer.launch({
@@ -71,8 +77,10 @@ jobs:
                   }, 150);
                 });
               });
-              // ✅ جایگزین waitForTimeout برای سازگاری با تمام نسخه‌ها
-              await new Promise(resolve => setTimeout(resolve, 2000));
+
+              // زمان صبر قابل تنظیم توسط کاربر
+              console.log(`Waiting ${waitSeconds} seconds for lazy content to load...`);
+              await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
 
               await page.screenshot({ path: screenshotPath, fullPage: true });
               console.log('Screenshot saved successfully');
@@ -172,9 +180,9 @@ jobs:
 
             echo "🔄 [$((idx+1))/$TOTAL_URLS] Processing session ID: $URL_FOLDER"
 
-            # اسکرین‌شات و HTML
+            # اسکرین‌شات و HTML (با دریافت wait_seconds از ورودی)
             SCREENSHOT_OK=false
-            if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html"; then
+            if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html" "${{ github.event.inputs.wait_seconds }}"; then
               SCREENSHOT_OK=true
               echo "  ✅ Puppeteer succeeded"
             else

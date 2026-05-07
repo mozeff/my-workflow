@@ -1,4 +1,4 @@
-name: TG Channel Last Messages
+name: ✈️ 09-TG Channel Last Messages
 
 on:
   workflow_dispatch:
@@ -44,7 +44,6 @@ jobs:
         id: channel_info
         run: |
           CH="${{ github.event.inputs.channel }}"
-          # Remove URL prefix and '@'
           CLEAN=$(echo "$CH" | sed -E 's|https?://t\.me/||i' | sed 's/^@//' | sed 's|/.*||')
           echo "slug=$CLEAN" >> $GITHUB_OUTPUT
 
@@ -76,7 +75,7 @@ jobs:
               process.exit(1);
             }
 
-            // Extract last 10 messages (newest first)
+            // Extract last 10 messages (newest first) with links, no console log
             const messages = await page.evaluate(() => {
               const msgElements = document.querySelectorAll('.tgme_widget_message_wrap');
               const msgs = [];
@@ -86,19 +85,21 @@ jobs:
                 const dateEl = el.querySelector('.tgme_widget_message_date time');
                 const text = textEl ? textEl.innerText.trim() : '';
                 const date = dateEl ? dateEl.getAttribute('datetime') : '';
-                msgs.push({ date, text });
+                const postId = el.getAttribute('data-post');
+                const link = postId ? `https://t.me/${postId}` : '';
+                msgs.push({ date, text, link });
               });
               return msgs;
             });
 
-            // Write messages.txt
+            // Write messages.txt with links included
             let txt = '';
             messages.forEach((m, idx) => {
-              txt += `${idx+1}. ${m.date}\n${m.text}\n\n`;
+              txt += `${idx+1}. ${m.date}\n${m.link}\n${m.text}\n\n`;
             });
             fs.writeFileSync('messages.txt', txt.trim());
 
-            // Take screenshot (viewport only to capture top messages)
+            // Take screenshot
             await page.screenshot({ path: 'screenshot.png' });
             await browser.close();
           })();
