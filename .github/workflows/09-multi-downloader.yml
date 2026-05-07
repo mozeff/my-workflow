@@ -90,7 +90,7 @@ jobs:
           EOF
 
       # ------------------------------------------------------------
-      # توابع تولید نام تصادفی عددی
+      # توابع تولید نام تصادفی عددی + ایجاد README با تصاویر به‌ترتیب
       # ------------------------------------------------------------
       - name: Process each URL and collect all data
         shell: bash
@@ -131,6 +131,13 @@ jobs:
 
           TOTAL_URLS=${#URLS_ARRAY[@]}
           TOTAL_MEDIA=0
+          GLOBAL_IMG_COUNTER=0  # ★ شمارنده سراسری برای تصاویر
+
+          # ساخت هدر README.md اصلی
+          cat > "$BATCH_PATH/README.md" << 'README_HEADER'
+          # 📸 Downloaded Images (in order)
+          README_HEADER
+          echo "" >> "$BATCH_PATH/README.md"
 
           # ایجاد یک index کلی برای batch
           cat > "$BATCH_PATH/index.md" << INDEX_HEADER
@@ -145,7 +152,7 @@ jobs:
           for (( idx=0; idx<${TOTAL_URLS}; idx++ )); do
             RAW_URL="${URLS_ARRAY[$idx]}"
 
-            # افزودن پروتکل در صورت نیاز – شبیه نمونه اصلی
+            # افزودن پروتکل در صورت نیاز
             if [[ ! "$RAW_URL" =~ ^https?:// ]]; then
               HTTPS_URL="https://$RAW_URL"
               if curl -fsL --connect-timeout 10 --max-time 30 -o /dev/null "$HTTPS_URL" 2>/dev/null; then
@@ -183,6 +190,7 @@ jobs:
 
             # فرمت‌های رسانه‌ای قابل دانلود
             MEDIA_EXT='png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|zip|rar|tar|gz|7z'
+            IMG_EXT='png|jpg|jpeg|gif|svg|webp'  # ★ فقط تصاویر
 
             > "$FOLDER/media_links.txt"
             > "$FOLDER/other_links.txt"
@@ -213,7 +221,10 @@ jobs:
                   SIZE=$(stat -c%s "$MEDIA_DIR/$SAFE_NAME" 2>/dev/null || echo 0)
                   if [[ "$SIZE" -gt 0 ]]; then
                     echo "$link" >> "$FOLDER/media_links.txt"
-                    if [[ "$ext_lower" =~ ^(png|jpg|jpeg|gif|svg|webp)$ ]]; then
+                    if [[ "$ext_lower" =~ ^($IMG_EXT)$ ]]; then
+                      # ★ اضافه کردن به README عمومی با شماره ترتیب
+                      GLOBAL_IMG_COUNTER=$((GLOBAL_IMG_COUNTER + 1))
+                      echo "$GLOBAL_IMG_COUNTER. ![$SAFE_NAME](./$URL_FOLDER/media/$SAFE_NAME)" >> "$BATCH_PATH/README.md"
                       echo "![$SAFE_NAME](./media/$SAFE_NAME)" >> "$FOLDER/downloaded_media.md"
                     else
                       echo "- [$SAFE_NAME](./media/$SAFE_NAME) (${SIZE} bytes)" >> "$FOLDER/downloaded_media.md"
@@ -225,7 +236,7 @@ jobs:
               fi
             done < "$FOLDER/all_links.txt"
 
-            # ساخت index.md برای این URL (بدون افشای URL)
+            # ساخت index.md برای این URL
             MEDIA_COUNT=$(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l)
             {
               echo "# Session ID: $URL_FOLDER"
@@ -270,12 +281,16 @@ jobs:
           echo "- Total URLs: $TOTAL_URLS" >> "$BATCH_PATH/index.md"
           echo "- Total media files: $TOTAL_MEDIA" >> "$BATCH_PATH/index.md"
 
+          # ★ پایان README.md
+          echo "" >> "$BATCH_PATH/README.md"
+          echo "**Total images:** $GLOBAL_IMG_COUNTER" >> "$BATCH_PATH/README.md"
+
           # ذخیره متغیرها برای مراحل بعد
           echo "BATCH_FOLDER=$BATCH_FOLDER" >> $GITHUB_ENV
           echo "TOTAL_URLS=$TOTAL_URLS" >> $GITHUB_ENV
           echo "TOTAL_MEDIA=$TOTAL_MEDIA" >> $GITHUB_ENV
 
-          echo "✅ All URLs processed."
+          echo "✅ All URLs processed. README with $GLOBAL_IMG_COUNTER images created."
 
       # ------------------------------------------------------------
       # ایجاد ZIP (با رمز اختیاری) و حذف پوشه اصلی
