@@ -32,32 +32,37 @@ jobs:
           sudo apt-get install -y -qq python3-pip
           pip3 install --upgrade yt-dlp
 
-      - name: Extract video links from channel
+      - name: Extract video links from channel (with member‑only info)
         run: |
           CHANNEL_URL="${{ github.event.inputs.channel_url }}"
           NUM_LINKS="${{ github.event.inputs.num_links }}"
 
           echo "Extracting up to ${NUM_LINKS} video links from: ${CHANNEL_URL}"
 
-          # Generate the list using yt-dlp with flat playlist
           LINKS_FILE="/tmp/channel_links.md"
           {
             echo "# Video Links from ${CHANNEL_URL}"
             echo ""
             echo "Total requested: ${NUM_LINKS}"
             echo ""
-            echo "| # | Title | Link |"
-            echo "|---|-------|------|"
+            echo "| # | Title | Link | Member Only |"
+            echo "|---|-------|------|-------------|"
           } > "$LINKS_FILE"
 
           INDEX=1
-          while IFS='|' read -r TITLE URL; do
+          while IFS='|' read -r AVAIL TITLE URL; do
             if [ -n "$TITLE" ] && [ -n "$URL" ]; then
-              printf "| %d | %s | [Watch](%s) |\n" "$INDEX" "$TITLE" "$URL" >> "$LINKS_FILE"
+              # Detect member‑only status from the availability field
+              if [ "$AVAIL" = "subscriber_only" ]; then
+                MEMBER="🔒 Yes"
+              else
+                MEMBER="No"
+              fi
+              printf "| %d | %s | [Watch](%s) | %s |\n" "$INDEX" "$TITLE" "$URL" "$MEMBER" >> "$LINKS_FILE"
               INDEX=$((INDEX + 1))
             fi
           done < <(yt-dlp --flat-playlist --playlist-end "$NUM_LINKS" \
-                     --print "%(title)s|%(webpage_url)s" \
+                     --print "%(availability)s|%(title)s|%(webpage_url)s" \
                      "$CHANNEL_URL" 2>/dev/null || echo "Failed to extract.")
 
           echo "" >> "$LINKS_FILE"

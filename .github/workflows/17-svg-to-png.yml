@@ -1,0 +1,85 @@
+name: 🖼️ tool-SVG to PNG Converter
+
+on:
+  workflow_dispatch:
+    inputs:
+      svg_path:
+        description: 'Path to SVG file inside the repo (e.g., images/logo.svg)'
+        required: true
+        type: string
+      png_path:
+        description: 'Output PNG path (default: same name with .png extension)'
+        required: false
+        type: string
+
+jobs:
+  convert-svg-to-png:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install rsvg-convert
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librsvg2-bin
+
+      - name: Convert SVG to PNG
+        run: |
+          SVG_FILE="${{ github.event.inputs.svg_path }}"
+          PNG_FILE="${ { github.event.inputs.png_path } }"
+
+          # If no output path given, replace .svg with .png
+          if [ -z "$PNG_FILE" ]; then
+            PNG_FILE="${SVG_FILE%.svg}.png"
+          fi
+
+          echo "Converting '$SVG_FILE' → '$PNG_FILE'"
+          mkdir -p "$(dirname "$PNG_FILE")"
+          rsvg-convert --output "$PNG_FILE" "$SVG_FILE"
+          echo "Conversion complete."
+
+      - name: Commit and push PNG to repository
+        run: |
+          SVG_FILE="${{ github.event.inputs.svg_path }}"
+          PNG_FILE="${ { github.event.inputs.png_path } }"
+          [ -z "$PNG_FILE" ] && PNG_FILE="${SVG_FILE%.svg}.png"
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          BRANCH="${GITHUB_REF_NAME}"
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
+
+          # Force-add the new PNG (even if .gitignored, but usually not)
+          git add --force "$PNG_FILE"
+
+          if git diff --cached --quiet; then
+            echo "No changes to push."
+            exit 0
+          fi
+
+          git commit -m "[SVG→PNG] Converted ${SVG_FILE} to PNG [skip ci]"
+
+          RETRY_MAX=10
+          for ((i=1; i<=RETRY_MAX; i++)); do
+            echo "Push attempt $i/$RETRY_MAX"
+            if git push origin HEAD:"$BRANCH" 2>&1; then
+              echo "Push successful!"
+              exit 0
+            else
+              WAIT=$((2 + RANDOM % 8))
+              echo "Push failed, retrying in ${WAIT}s..."
+              sleep $WAIT
+            fi
+          done
+
+          echo "All push attempts failed."
+          exit 1
