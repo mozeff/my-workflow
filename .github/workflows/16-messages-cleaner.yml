@@ -1,0 +1,49 @@
+name: 🗑 13-Clean Channel Messages folder
+
+on:
+  workflow_dispatch:
+    inputs:
+      warning:
+        description: '⚠️ هشدار: این کار تمام پوشه‌ی channel_messages/ را پاک می‌کند و از نو می‌سازد. فقط در صورت اطمینان ادامه دهید.'
+        required: false
+        default: 'این هشدار را قبل از اجرا بخوانید'
+
+jobs:
+  clean-channel-messages:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Recreate channel_messages folder with README
+        run: |
+          rm -rf channel_messages
+          mkdir channel_messages
+          cat > channel_messages/README.md << 'EOF'
+          # Channel Messages
+          
+          ---
+          
+          This folder is empty. Start fetching Telegram channel messages using the available workflows to save them here.
+          
+          ---
+          EOF
+          echo "channel_messages folder cleaned and README.md added."
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add channel_messages/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "[Clean] Clear channel_messages folder [skip ci]"
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push origin HEAD:"${{ github.ref_name }}"
+            echo "✅ channel_messages folder has been cleaned and committed."
+          fi

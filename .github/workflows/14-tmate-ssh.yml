@@ -1,4 +1,4 @@
-name: 99-🖥️ SSH به رانر (فقط tmate)
+name: 🖥️ test-SSH به رانر (فقط tmate)
 
 on:
   workflow_dispatch:

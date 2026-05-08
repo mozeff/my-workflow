@@ -8,10 +8,30 @@ on:
         required: true
         type: string
       quality:
-        description: 'Video quality (best, 1080, 720, 480, audio)'
+        description: 'Video quality (if not audio only)'
         required: false
         default: '480'
-        type: string
+        type: choice
+        options:
+          - '144'
+          - '240'
+          - '360'
+          - '480'
+          - '720'
+          - '1080'
+          - '1440'
+          - '2160'
+          - 'best'
+      audio_only:
+        description: 'Download audio only (ignore quality setting)'
+        required: false
+        default: false
+        type: boolean
+      compression_level:
+        description: '7z compression level (0=store, 9=ultra)'
+        required: false
+        default: 0
+        type: number
       password:
         description: 'Password for 7z archives (optional)'
         required: false
@@ -86,14 +106,23 @@ jobs:
 
           pip3 install --upgrade yt-dlp
 
-      - name: Download YouTube video
+      - name: Download YouTube video/audio
         run: |
           set -euo pipefail
           URL="${{ github.event.inputs.youtube_url }}"
           QUALITY="${{ github.event.inputs.quality }}"
+          AUDIO_ONLY="${{ github.event.inputs.audio_only }}"
+          COMPRESSION="${{ github.event.inputs.compression_level }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
           SPLIT_MB=90
           SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
+          # Validate compression level (0-9)
+          if [ "$COMPRESSION" -lt 0 ]; then
+            COMPRESSION=0
+          elif [ "$COMPRESSION" -gt 9 ]; then
+            COMPRESSION=9
+          fi
 
           BACKUP_DIR="/tmp/video_backup_$$"
           mkdir -p "$BACKUP_DIR"
@@ -102,8 +131,9 @@ jobs:
           mkdir -p videos tmp_downloads
 
           echo "Downloading: $URL"
-          echo "Quality: $QUALITY"
-          echo "Backup dir: $BACKUP_DIR"
+          echo "Audio only: $AUDIO_ONLY"
+          echo "Quality: $QUALITY (ignored if audio only)"
+          echo "Compression level: $COMPRESSION (mx=$COMPRESSION)"
           if [ -n "$ZIP_PASSWORD" ]; then
             echo "Password protection: ENABLED"
           else
@@ -118,22 +148,29 @@ jobs:
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
 
-          case "$QUALITY" in
-            audio)
-              FORMAT="bestaudio" ;;
-            best)
-              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" ;;
-            1080)
-              FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best" ;;
-            720)
-              FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best" ;;
-            480)
-              FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best" ;;
-            *)
-              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" ;;
-          esac
+          # Build format and flags
+          if [ "$AUDIO_ONLY" = "true" ]; then
+            FORMAT="bestaudio[ext=m4a]/bestaudio"
+            MERGE_FLAG=""
+            DOWNLOAD_TYPE="audio"
+          else
+            case "$QUALITY" in
+              144)  FORMAT="bestvideo[height<=144][ext=mp4]+bestaudio[ext=m4a]/best[height<=144][ext=mp4]/best" ;;
+              240)  FORMAT="bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/best[height<=240][ext=mp4]/best" ;;
+              360)  FORMAT="bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best" ;;
+              480)  FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best" ;;
+              720)  FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best" ;;
+              1080) FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best" ;;
+              1440) FORMAT="bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/best[height<=1440][ext=mp4]/best" ;;
+              2160) FORMAT="bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[height<=2160][ext=mp4]/best" ;;
+              best)  FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" ;;
+              *)     FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best" ;; # fallback
+            esac
+            MERGE_FLAG="--merge-output-format mp4"
+            DOWNLOAD_TYPE="video"
+          fi
 
-          COMMON_FLAGS="--merge-output-format mp4 --output tmp_downloads/%(title)s.%(ext)s --no-part --no-playlist --retries 10 --fragment-retries 10 --no-check-certificates"
+          COMMON_FLAGS="--output tmp_downloads/%(title)s.%(ext)s $MERGE_FLAG --no-part --no-playlist --retries 10 --fragment-retries 10 --no-check-certificates"
 
           METHODS=(
             "--proxy socks5://127.0.0.1:1080 --extractor-args youtube:player_client=mweb --concurrent-fragments 4"
@@ -184,7 +221,6 @@ jobs:
             local CANDIDATE
             while true; do
               CANDIDATE=$(generate_random_numeric_name)
-              # بررسی عدم وجود پوشه در videos و backup
               if [ ! -d "videos/$CANDIDATE" ] && [ ! -d "$BACKUP_DIR/$CANDIDATE" ]; then
                 echo "$CANDIDATE"
                 return
@@ -207,7 +243,6 @@ jobs:
             FILENAME_NO_EXT=$(sanitize_name "$FILENAME_NO_EXT")
             echo "Processing: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
 
-            # نام پوشه کاملاً تصادفی عددی (جایگزین اسم فایل)
             FINAL_FOLDER_NAME=$(get_unique_numeric_folder)
             mkdir -p "$BACKUP_DIR/${FINAL_FOLDER_NAME}"
             echo "Created backup folder: $BACKUP_DIR/${FINAL_FOLDER_NAME}"
@@ -215,14 +250,16 @@ jobs:
 
             FOLDER_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}")
 
+            COMPRESS_FLAG="-mx=${COMPRESSION}"   # سطح فشرده‌سازی انتخاب‌شده
+
             if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
               echo "Splitting $BASENAME into ${SPLIT_MB}MB parts..."
 
               ARCHIVE_BASE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}"
               if [ -n "$ZIP_PASSWORD" ]; then
-                7z a -v${SPLIT_MB}m -p"${ZIP_PASSWORD}" -mhe=on -mx=0 "${ARCHIVE_BASE}.7z" "$FILE"
+                7z a -v${SPLIT_MB}m -p"${ZIP_PASSWORD}" -mhe=on ${COMPRESS_FLAG} "${ARCHIVE_BASE}.7z" "$FILE"
               else
-                7z a -v${SPLIT_MB}m -mx=0 "${ARCHIVE_BASE}.7z" "$FILE"
+                7z a -v${SPLIT_MB}m ${COMPRESS_FLAG} "${ARCHIVE_BASE}.7z" "$FILE"
               fi
 
               PART_COUNT=$(ls "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.7z* 2>/dev/null | wc -l)
@@ -245,21 +282,28 @@ jobs:
                 DOWNLOAD_LINKS_MD+="| ${LINK_NUM} | \`${PART_BASENAME}\` | [Download](${RAW_LINK}) |"$'\n'
               done
 
+              # اطلاعات کیفیت / نوع
+              if [ "$AUDIO_ONLY" = "true" ]; then
+                MEDIA_INFO_LINE="| **Type** | **Audio only (best quality)** |"
+              else
+                MEDIA_INFO_LINE="| **Quality** | **${QUALITY}** |"
+              fi
+
               README_FILE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
-              # Using printf instead of heredoc to avoid YAML indentation error
               printf '%s\n' \
                 "# ${FILENAME_NO_EXT}" \
                 "" \
                 "---" \
                 "" \
-                "## Video Information" \
+                "## ${DOWNLOAD_TYPE^} Information" \
                 "" \
                 "| Property | Value |" \
                 "|----------|-------|" \
-                "| **Video Name** | \`${FILENAME_NO_EXT}\` |" \
-                "| **Original Link** | [YouTube Video](${URL}) |" \
+                "| **Name** | \`${FILENAME_NO_EXT}\` |" \
+                "| **Original Link** | [YouTube ${DOWNLOAD_TYPE^}](${URL}) |" \
                 "| **Total Size** | **${PART_COUNT} parts** - **${TOTAL_SIZE_MB} MB** |" \
-                "| **Quality** | **${QUALITY}** |" \
+                "${MEDIA_INFO_LINE}" \
+                "| **Compression** | **level ${COMPRESSION} (mx=${COMPRESSION})** |" \
                 "| **Status** | **Complete (100%)** |" \
                 "| **Password Protected** | **$( [ -n "$ZIP_PASSWORD" ] && echo "YES" || echo "NO" )** |" \
                 "" \
@@ -278,7 +322,7 @@ jobs:
                 "1. **Download** all parts (e.g., \`.7z.001\`, \`.7z.002\`...)" \
                 "2. **Install** [7-Zip](https://www.7-zip.org/) (Windows/Linux) or [Keka](https://www.keka.io/) (Mac)" \
                 "3. **Right-click** the \`.7z.001\` file → Extract Here" \
-                "4. All parts combine automatically into the original video" \
+                "4. All parts combine automatically into the original file" \
                 $(if [ -n "$ZIP_PASSWORD" ]; then echo "'5. Enter the password when prompted'"; fi) \
                 "" \
                 "---" \
@@ -289,7 +333,7 @@ jobs:
             else
               if [ -n "$ZIP_PASSWORD" ]; then
                 echo "Creating password-protected 7z archive: $BASENAME"
-                7z a -p"${ZIP_PASSWORD}" -mhe=on -mx=0 "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.7z" "$FILE"
+                7z a -p"${ZIP_PASSWORD}" -mhe=on ${COMPRESS_FLAG} "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.7z" "$FILE"
                 ARCHIVE_EXT="7z"
               else
                 echo "Copying file directly: $BASENAME"
@@ -302,7 +346,14 @@ jobs:
               RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED}"
 
               README_FILE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
-              # Using printf instead of heredoc to avoid YAML indentation error
+
+              # اطلاعات کیفیت / نوع
+              if [ "$AUDIO_ONLY" = "true" ]; then
+                MEDIA_INFO_LINE="| **Type** | **Audio only (best quality)** |"
+              else
+                MEDIA_INFO_LINE="| **Quality** | **${QUALITY}** |"
+              fi
+
               if [ "$ARCHIVE_EXT" = "7z" ]; then
                 EXTRACT_LINE1="1. **Install** [7-Zip](https://www.7-zip.org/) (Windows/Linux) or [Keka](https://www.keka.io/) (Mac)"
                 EXTRACT_LINE2="2. **Right-click** the \`.7z\` file → Extract Here"
@@ -322,14 +373,15 @@ jobs:
                 "" \
                 "---" \
                 "" \
-                "## Video Information" \
+                "## ${DOWNLOAD_TYPE^} Information" \
                 "" \
                 "| Property | Value |" \
                 "|----------|-------|" \
-                "| **Video Name** | \`${FILENAME_NO_EXT}\` |" \
-                "| **Original Link** | [YouTube Video](${URL}) |" \
+                "| **Name** | \`${FILENAME_NO_EXT}\` |" \
+                "| **Original Link** | [YouTube ${DOWNLOAD_TYPE^}](${URL}) |" \
                 "| **Total Size** | **1 $( [ "$ARCHIVE_EXT" = "7z" ] && echo "archive" || echo "file" )** - **${SIZE_MB} MB** |" \
-                "| **Quality** | **${QUALITY}** |" \
+                "${MEDIA_INFO_LINE}" \
+                "| **Compression** | **level ${COMPRESSION} (mx=${COMPRESSION})** |" \
                 "| **Status** | **Complete (100%)** |" \
                 "| **Password Protected** | **$( [ -n "$ZIP_PASSWORD" ] && echo "YES" || echo "NO" )** |" \
                 "" \

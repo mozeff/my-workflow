@@ -1,4 +1,4 @@
-name: ✈️ 07-TG Downloader
+name: ✈️ 08-TG Downloader
 
 on:
   workflow_dispatch:

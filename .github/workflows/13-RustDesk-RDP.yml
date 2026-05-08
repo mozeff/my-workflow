@@ -1,4 +1,4 @@
-name: 🦀 دسکتاپ با RustDesk
+name: 🦀 test-دسکتاپ با RustDesk
 
 on:
   workflow_dispatch:

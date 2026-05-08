@@ -1,4 +1,4 @@
-name: ✈️ 09-TG Channel Last Messages
+name: ✈️ 10-TG Channel Last Messages
 
 on:
   workflow_dispatch:
