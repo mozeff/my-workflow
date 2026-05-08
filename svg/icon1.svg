@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="400" height="400">
+  <defs>
+    <!-- گرادیان طلایی برای مهره وزیر -->
+    <linearGradient id="goldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ffe680;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#f0a500;stop-opacity:1"/>
+    </linearGradient>
+    <!-- گرادیان پس‌زمینه -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2b2b2b;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#1e1e1e;stop-opacity:1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- پس‌زمینه دایره‌ای -->
+  <circle cx="100" cy="100" r="90" fill="url(#bgGrad)" stroke="#ffd966" stroke-width="2"/>
+
+  <!-- پایه -->
+  <ellipse cx="100" cy="165" rx="38" ry="12" fill="url(#goldGrad)"/>
+  
+  <!-- بدنه -->
+  <path d="M 72 165 L 78 130 L 122 130 L 128 165 Z" fill="url(#goldGrad)"/>
+  
+  <!-- گردن (بزرگ‌تر شده) -->
+  <rect x="86" y="102" width="28" height="28" fill="url(#goldGrad)"/>
+  
+  <!-- تاج (سه قله) — برای چسبیدن به گردن جدید ۳ واحد پایین‌تر آمده -->
+  <polygon points="55,102 72,67 87,90 100,57 113,90 128,67 145,102" fill="url(#goldGrad)"/>
+  
+  <!-- گوی‌های نوک تاج -->
+  <circle cx="72" cy="67" r="5" fill="#ffd966"/>
+  <circle cx="100" cy="57" r="5" fill="#ffd966"/>
+  <circle cx="128" cy="67" r="5" fill="#ffd966"/>
+
+  <!-- نوشته N -->
+  <text x="100" y="84" text-anchor="middle" font-family="Arial,sans-serif"
+        font-weight="bold" font-size="22" fill="#2b2b2b">N</text>
+</svg>
