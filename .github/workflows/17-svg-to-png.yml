@@ -1,19 +1,16 @@
-name: 🖼️ tool-SVG to PNG Converter
+name: 🖼️ Convert All SVGs to PNG
 
 on:
   workflow_dispatch:
     inputs:
-      svg_path:
-        description: 'Path to SVG file inside the repo (e.g., images/logo.svg)'
-        required: true
-        type: string
-      png_path:
-        description: 'Output PNG path (default: same name with .png extension)'
+      glob_pattern:
+        description: 'Glob pattern for SVG files (default: **/*.svg)'
         required: false
+        default: '**/*.svg'
         type: string
 
 jobs:
-  convert-svg-to-png:
+  convert-all-svgs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -30,27 +27,27 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq librsvg2-bin
 
-      - name: Convert SVG to PNG
+      - name: Convert all matching SVGs to PNG
         run: |
-          SVG_FILE="${{ github.event.inputs.svg_path }}"
-          PNG_FILE="${ { github.event.inputs.png_path } }"
+          PATTERN="${{ github.event.inputs.glob_pattern }}"
+          echo "Looking for SVGs with pattern: $PATTERN"
 
-          # If no output path given, replace .svg with .png
-          if [ -z "$PNG_FILE" ]; then
-            PNG_FILE="${SVG_FILE%.svg}.png"
-          fi
+          # Enable recursive globbing (**/*.svg)
+          shopt -s globstar nullglob
+          svgs=( $PATTERN )
+          echo "Found ${#svgs[@]} SVG(s)."
 
-          echo "Converting '$SVG_FILE' → '$PNG_FILE'"
-          mkdir -p "$(dirname "$PNG_FILE")"
-          rsvg-convert --output "$PNG_FILE" "$SVG_FILE"
-          echo "Conversion complete."
+          for svg in "${svgs[@]}"; do
+            png="${svg%.svg}.png"
+            echo "Converting: $svg → $png"
+            mkdir -p "$(dirname "$png")"
+            rsvg-convert --output "$png" "$svg"
+          done
 
-      - name: Commit and push PNG to repository
+          echo "All conversions finished."
+
+      - name: Commit and push all generated PNGs
         run: |
-          SVG_FILE="${{ github.event.inputs.svg_path }}"
-          PNG_FILE="${ { github.event.inputs.png_path } }"
-          [ -z "$PNG_FILE" ] && PNG_FILE="${SVG_FILE%.svg}.png"
-
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
@@ -58,15 +55,16 @@ jobs:
           git fetch origin "$BRANCH"
           git reset --hard origin/"$BRANCH"
 
-          # Force-add the new PNG (even if .gitignored, but usually not)
-          git add --force "$PNG_FILE"
+          # Add all PNG files in the repo (recursively)
+          shopt -s globstar nullglob
+          git add --force **/*.png
 
           if git diff --cached --quiet; then
             echo "No changes to push."
             exit 0
           fi
 
-          git commit -m "[SVG→PNG] Converted ${SVG_FILE} to PNG [skip ci]"
+          git commit -m "🖼️ Converted SVGs to PNGs [skip ci]"
 
           RETRY_MAX=10
           for ((i=1; i<=RETRY_MAX; i++)); do

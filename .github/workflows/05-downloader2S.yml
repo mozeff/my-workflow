@@ -42,6 +42,11 @@ on:
         required: false
         default: '80'
         type: string
+      show_video_name:
+        description: 'Show video original title in README?'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   download-youtube:
@@ -120,6 +125,7 @@ jobs:
           COMPRESSION="${{ github.event.inputs.compression_level }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
           SPLIT_SIZE_MB="${{ github.event.inputs.split_size }}"
+          SHOW_NAME="${{ github.event.inputs.show_video_name }}"
 
           # Validate compression level (0-9)
           if [ "$COMPRESSION" -lt 0 ]; then
@@ -143,6 +149,7 @@ jobs:
           echo "Quality: $QUALITY (ignored if audio only)"
           echo "Compression level: $COMPRESSION (mx=$COMPRESSION)"
           echo "Split size: $SPLIT_SIZE_MB MB"
+          echo "Show video name in README: $SHOW_NAME"
           if [ -n "$ZIP_PASSWORD" ]; then
             echo "Password protection: ENABLED"
           else
@@ -157,22 +164,22 @@ jobs:
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
 
-          # Build format and flags
+          # Build format and flags (FIX: removed restrictive ext filters)
           if [ "$AUDIO_ONLY" = "true" ]; then
-            FORMAT="bestaudio[ext=m4a]/bestaudio"
+            FORMAT="bestaudio/best"
             DOWNLOAD_TYPE="audio"
           else
             case "$QUALITY" in
-              144)  FORMAT="bestvideo[height<=144][ext=mp4]+bestaudio[ext=m4a]/best[height<=144][ext=mp4]/best" ;;
-              240)  FORMAT="bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/best[height<=240][ext=mp4]/best" ;;
-              360)  FORMAT="bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best" ;;
-              480)  FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best" ;;
-              720)  FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best" ;;
-              1080) FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best" ;;
-              1440) FORMAT="bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/best[height<=1440][ext=mp4]/best" ;;
-              2160) FORMAT="bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[height<=2160][ext=mp4]/best" ;;
-              best)  FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" ;;
-              *)     FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best" ;;
+              144)  FORMAT="bestvideo[height<=144]+bestaudio/best[height<=144]" ;;
+              240)  FORMAT="bestvideo[height<=240]+bestaudio/best[height<=240]" ;;
+              360)  FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]" ;;
+              480)  FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
+              720)  FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
+              1080) FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
+              1440) FORMAT="bestvideo[height<=1440]+bestaudio/best[height<=1440]" ;;
+              2160) FORMAT="bestvideo[height<=2160]+bestaudio/best[height<=2160]" ;;
+              best) FORMAT="bestvideo+bestaudio/best" ;;
+              *)    FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
             esac
             DOWNLOAD_TYPE="video"
           fi
@@ -260,6 +267,20 @@ jobs:
           FOLDER_ENCODED=$(urlencode "$FINAL_FOLDER")
           COMPRESS_FLAG="-mx=${COMPRESSION}"
 
+          # Decide README title
+          if [ "$SHOW_NAME" = "true" ]; then
+            README_TITLE="# ${FILENAME_NO_EXT}"
+          else
+            README_TITLE="# Downloaded ${DOWNLOAD_TYPE^}"
+          fi
+
+          # Helper function to output the Name row only if enabled
+          name_row() {
+            if [ "$SHOW_NAME" = "true" ]; then
+              echo "| **Name** | \`${FILENAME_NO_EXT}\` |"
+            fi
+          }
+
           if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
             echo "Splitting into ${SPLIT_SIZE_MB}MB parts..."
             ARCHIVE_BASE="$FINAL_PATH/${FINAL_FOLDER}"
@@ -278,14 +299,14 @@ jobs:
 
             # README
             {
-              echo "# ${FILENAME_NO_EXT}"
+              echo "$README_TITLE"
               echo ""
               echo "---"
               echo "## ${DOWNLOAD_TYPE^} Information"
               echo ""
               echo "| Property | Value |"
               echo "|----------|-------|"
-              echo "| **Name** | \`${FILENAME_NO_EXT}\` |"
+              name_row
               echo "| **Original Link** | [YouTube ${DOWNLOAD_TYPE^}](${URL}) |"
               echo "| **Total Size** | **${PART_COUNT} parts** - **${TOTAL_SIZE_MB} MB** |"
               [ "$AUDIO_ONLY" != "true" ] && echo "| **Quality** | **${QUALITY}** |" || echo "| **Type** | **Audio only** |"
@@ -330,14 +351,14 @@ jobs:
             RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED}"
 
             {
-              echo "# ${FILENAME_NO_EXT}"
+              echo "$README_TITLE"
               echo ""
               echo "---"
               echo "## ${DOWNLOAD_TYPE^} Information"
               echo ""
               echo "| Property | Value |"
               echo "|----------|-------|"
-              echo "| **Name** | \`${FILENAME_NO_EXT}\` |"
+              name_row
               echo "| **Original Link** | [YouTube ${DOWNLOAD_TYPE^}](${URL}) |"
               echo "| **Size** | ${SIZE_MB} MB |"
               [ "$AUDIO_ONLY" != "true" ] && echo "| **Quality** | **${QUALITY}** |" || echo "| **Type** | **Audio only** |"
