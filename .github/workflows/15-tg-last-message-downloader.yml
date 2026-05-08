@@ -1,4 +1,4 @@
-name: 📥 Download Newest File from Telegram Channel
+name: 📥 test-Download Newest File from Telegram Channel
 
 on:
   workflow_dispatch:

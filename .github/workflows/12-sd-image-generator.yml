@@ -1,4 +1,4 @@
-name: 🖼️ 10-SD Image Generator (Cached)
+name: 🖼️ test-SD Image Generator (Cached)
 
 on:
   workflow_dispatch:
