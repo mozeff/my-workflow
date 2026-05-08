@@ -187,13 +187,22 @@ jobs:
           for idx in "${!METHODS[@]}"; do
             METHOD_NUM=$((idx+1))
             echo "Trying download method $METHOD_NUM/${#METHODS[@]}..."
-            if yt-dlp --format "$FORMAT" $COMMON_FLAGS ${METHODS[$idx]} "$URL"; then
+            # اجرای yt-dlp و گرفتن کد خروجی (حتی اگر خطا برگرداند)
+            set +e
+            yt-dlp --format "$FORMAT" $COMMON_FLAGS ${METHODS[$idx]} "$URL"
+            YT_EXIT_CODE=$?
+            set -e
+
+            # موفقیت در صورتی که کد خروجی صفر باشد یا حداقل یک فایل کامل وجود داشته باشد
+            if [ $YT_EXIT_CODE -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
               DOWNLOAD_SUCCESS=true
-              echo "Download successful with method $METHOD_NUM!"
+              echo "Download successful with method $METHOD_NUM! (yt-dlp exit code: $YT_EXIT_CODE)"
               break
             else
-              echo "Method $METHOD_NUM failed, waiting before next attempt..."
+              echo "Method $METHOD_NUM failed (exit code: $YT_EXIT_CODE), waiting before next attempt..."
               sleep $((RANDOM % 10 + 5))
+              # پاک‌سازی فایل‌های ناقص
+              find tmp_downloads -name "*.part" -delete 2>/dev/null || true
             fi
           done
 
