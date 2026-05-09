@@ -51,12 +51,12 @@ on:
         type: boolean
         default: false
       delay:
-        description: 'Delay between each URL (seconds)'
+        description: 'Delay between each URL (seconds, can be decimal like 3)'
         required: false
         default: '3'
-        type: number
+        type: string
       add_jitter:
-        description: 'Add random 0-1 second jitter to the delay'
+        description: 'Add random 0-1 second jitter (sub-second precision)'
         required: false
         default: false
         type: boolean
@@ -106,10 +106,10 @@ jobs:
           SPLIT_THRESHOLD_MB=${{ github.event.inputs.split_size }}
           TAKE_SCREENSHOT="${{ github.event.inputs.take_screenshot }}"
           DOWNLOAD_IMAGES="${{ github.event.inputs.download_images }}"
-          DELAY=${{ github.event.inputs.delay }}
+          DELAY="${{ github.event.inputs.delay }}"
           ADD_JITTER="${{ github.event.inputs.add_jitter }}"
 
-          if ! [[ "$DELAY" =~ ^[0-9]+$ ]] || [ "$DELAY" -lt 0 ]; then
+          if ! [[ "$DELAY" =~ ^[0-9]+(\.[0-9]+)?$ ]] || [ "$(echo "$DELAY < 0" | bc)" -eq 1 ]; then
             DELAY=0
           fi
           if ! [[ "$SPLIT_THRESHOLD_MB" =~ ^[0-9]+$ ]] || [ "$SPLIT_THRESHOLD_MB" -le 0 ]; then
@@ -133,7 +133,6 @@ jobs:
           echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
           mkdir -p tmp_downloads
 
-          # --- توابع کمکی ---
           generate_random_numeric_name() {
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
@@ -241,7 +240,7 @@ jobs:
           EOF
           fi
 
-          # پردازش URLها با تأخیر
+          # ── دانلود تمام لینک‌ها (با تأخیر) ──
           read -ra URL_ARRAY <<< "$URLS"
           TOTAL_URLS=${#URL_ARRAY[@]}
 
@@ -258,153 +257,178 @@ jobs:
             echo "📥 Direct download #$idx/$TOTAL_URLS: $URL -> $FILENAME"
             download_with_retry "$URL" "$FILENAME" || true
 
-            if [ $idx -lt $TOTAL_URLS ] && ([ "$DELAY" -gt 0 ] || [ "$ADD_JITTER" = "true" ]); then
+            if [ $idx -lt $TOTAL_URLS ]; then
               SLEEP_TIME=$DELAY
               if [ "$ADD_JITTER" = "true" ]; then
-                SLEEP_TIME=$(( DELAY + RANDOM % 2 ))
+                JITTER=$(echo "scale=3; $RANDOM/32767" | bc)
+                SLEEP_TIME=$(echo "$DELAY + $JITTER" | bc)
               fi
-              echo "⏳ Waiting ${SLEEP_TIME}s before next URL..."
-              sleep $SLEEP_TIME
+              if [ "$(echo "$SLEEP_TIME > 0" | bc)" -eq 1 ]; then
+                echo "⏳ Waiting ${SLEEP_TIME}s before next URL..."
+                sleep $SLEEP_TIME
+              fi
             fi
           done
 
-          # فشرده‌سازی تصاویر
+          # ── فشرده‌سازی تصاویر (همه‌ی فایل‌های tmp_downloads) ──
           if [ "$COMPRESS_IMAGES" = "true" ]; then
             echo "====== Compressing images ======"
             find tmp_downloads -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" -o -iname "*.bmp" \) -exec bash -c 'compress_image "$0"' {} \;
           fi
 
-          # بسته‌بندی و ساخت README (فقط حجم ZIP)
-          for FILE in tmp_downloads/*; do
-            [ -f "$FILE" ] || continue
-            SIZE=$(stat -c%s "$FILE")
-            BASENAME=$(basename "$FILE")
-            FOLDER_NAME=$(get_unique_numeric_folder)
-            mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
-            FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+          # ── بسته‌بندی یکپارچه (همه فایل‌ها در یک پوشه) ──
+          if [ -z "$( ls -A tmp_downloads 2>/dev/null )" ]; then
+            echo "No files downloaded!"
+            exit 1
+          fi
 
-            if [ "$MODE" = "none" ]; then
-              # حالت بدون بسته‌بندی – فقط فایل اصلی کپی می‌شود
-              mv "$FILE" "$BACKUP_DIR/$FOLDER_NAME/$BASENAME"
-              SIZE_MB=$(echo "scale=2; $SIZE/1048576" | bc)
-              printf '%s\n' \
-                "# Downloaded file" \
-                "" \
-                "Size: ${SIZE_MB} MB" \
-                "" \
-                "[Direct download](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "$BASENAME"))" \
-                > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+          FOLDER_NAME=$(get_unique_numeric_folder)
+          FINAL_DIR="$BACKUP_DIR/$FOLDER_NAME"
+          mkdir -p "$FINAL_DIR"
+          FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
 
-            elif [ "$MODE" = "zip" ]; then
+          # انتقال تمام فایل‌ها به پوشه نهایی
+          mv tmp_downloads/* "$FINAL_DIR"/
+          rmdir tmp_downloads
+
+          # محاسبه حجم کل فایل‌ها
+          TOTAL_SIZE=0
+          for f in "$FINAL_DIR"/*; do
+            TOTAL_SIZE=$(( TOTAL_SIZE + $(stat -c%s "$f") ))
+          done
+          TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE/1048576" | bc)
+
+          if [ "$MODE" = "none" ]; then
+            # بدون بسته‌بندی – فقط README با لینک مستقیم هر فایل
+            {
+              echo "# Downloaded files"
+              echo ""
+              echo "**Total size:** ${TOTAL_SIZE_MB} MB"
+              echo ""
+              echo "## Files"
+              for f in "$FINAL_DIR"/*; do
+                bname=$(basename "$f")
+                enc=$(urlencode "$bname")
+                echo "- [${bname}](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${enc})"
+              done
+            } > "$FINAL_DIR/README.md"
+
+          elif [ "$MODE" = "zip" ] || [ "$MODE" = "split" ]; then
+            cd "$BACKUP_DIR"
+            ZIP_NAME="${FOLDER_NAME}.zip"
+
+            # تصمیم‌گیری درباره اسپلیت
+            DO_SPLIT=false
+            if [ "$MODE" = "split" ] && [ "$TOTAL_SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
+              DO_SPLIT=true
+            fi
+
+            if [ "$DO_SPLIT" = true ]; then
+              echo "Splitting archive into ${SPLIT_THRESHOLD_MB}MB parts..."
               if [ -n "$ZIP_PASSWORD" ]; then
-                zip -j -P "$ZIP_PASSWORD" "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
+                zip -s ${SPLIT_THRESHOLD_MB}m -r -P "$ZIP_PASSWORD" "$ZIP_NAME" "$FOLDER_NAME"
               else
-                zip -j "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
+                zip -s ${SPLIT_THRESHOLD_MB}m -r "$ZIP_NAME" "$FOLDER_NAME"
               fi
-              ZIP_SIZE=$(stat -c%s "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip")
-              ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
-              printf '%s\n' \
-                "# Compressed file" \
-                "" \
-                "ZIP size: ${ZIP_MB} MB" \
-                "" \
-                "[Download ZIP](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "${FOLDER_NAME}.zip"))" \
-                > "$BACKUP_DIR/$FOLDER_NAME/README.md"
-              rm -f "$FILE"
-
-            elif [ "$MODE" = "split" ]; then
-              if [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
-                cd tmp_downloads
-                if [ -n "$ZIP_PASSWORD" ]; then
-                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$BASENAME"
-                else
-                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" "${FOLDER_NAME}.zip" "$BASENAME"
-                fi
-                for part in ${FOLDER_NAME}.z[0-9]* ${FOLDER_NAME}.zip; do
-                  [ -f "$part" ] && mv "$part" "$BACKUP_DIR/$FOLDER_NAME/"
-                done
-                cd ..
-                # محاسبه حجم کل قطعات
-                TOTAL_ZIP=0
-                for part in "$BACKUP_DIR/$FOLDER_NAME"/*; do
-                  [ -f "$part" ] && TOTAL_ZIP=$((TOTAL_ZIP + $(stat -c%s "$part")))
-                done
-                TOTAL_ZIP_MB=$(echo "scale=2; $TOTAL_ZIP/1048576" | bc)
-                # ساخت README (فقط حجم کل)
-                {
-                  echo "# Split ZIP archive"
-                  echo "Total size: ${TOTAL_ZIP_MB} MB"
-                  echo ""
-                  for part in "$BACKUP_DIR/$FOLDER_NAME"/*; do
-                    [ -f "$part" ] || continue
-                    part_name=$(basename "$part")
-                    echo "[${part_name}](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "$part_name"))"
-                  done
-                } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+            else
+              if [ -n "$ZIP_PASSWORD" ]; then
+                zip -qr -P "$ZIP_PASSWORD" "$ZIP_NAME" "$FOLDER_NAME"
               else
-                # فایل کوچک – همانند zip معمولی
-                if [ -n "$ZIP_PASSWORD" ]; then
-                  zip -j -P "$ZIP_PASSWORD" "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
-                else
-                  zip -j "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
-                fi
-                ZIP_SIZE=$(stat -c%s "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip")
-                ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
-                printf '%s\n' \
-                  "# Compressed file" \
-                  "" \
-                  "ZIP size: ${ZIP_MB} MB" \
-                  "" \
-                  "[Download ZIP](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "${FOLDER_NAME}.zip"))" \
-                  > "$BACKUP_DIR/$FOLDER_NAME/README.md"
-                rm -f "$FILE"
+                zip -qr "$ZIP_NAME" "$FOLDER_NAME"
               fi
             fi
-          done
 
-          rm -rf tmp_downloads
-          echo "Packaging completed."
+            # حذف پوشه اصلی (فقط ZIP/قطعات باقی بمانند)
+            rm -rf "$FOLDER_NAME"
+            mkdir -p "$FINAL_DIR"   # دوباره ایجاد برای قرار دادن ZIP و README
+
+            if [ "$DO_SPLIT" = true ]; then
+              # انتقال قطعات به پوشه
+              for part in ${FOLDER_NAME}.z[0-9]* ${ZIP_NAME}; do
+                [ -f "$part" ] && mv "$part" "$FINAL_DIR/"
+              done
+              # محاسبه حجم دقیق قطعات
+              ARCHIVE_SIZE=0
+              for part in "$FINAL_DIR"/*; do
+                ARCHIVE_SIZE=$(( ARCHIVE_SIZE + $(stat -c%s "$part") ))
+              done
+              ARCHIVE_MB=$(echo "scale=2; $ARCHIVE_SIZE/1048576" | bc)
+              # ساخت README
+              {
+                echo "# Combined split archive"
+                echo ""
+                echo "**Total archive size:** ${ARCHIVE_MB} MB"
+                echo ""
+                echo "**Parts:**"
+                for part in "$FINAL_DIR"/*; do
+                  pname=$(basename "$part")
+                  penc=$(urlencode "$pname")
+                  echo "- [${pname}](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${penc})"
+                done
+                echo ""
+                echo "Download all parts and extract \`${ZIP_NAME}\` with 7-Zip/WinRAR."
+              } > "$FINAL_DIR/README.md"
+            else
+              # یک فایل ZIP ساده
+              mv "${ZIP_NAME}" "$FINAL_DIR/"
+              ZIP_SIZE=$(stat -c%s "$FINAL_DIR/$ZIP_NAME")
+              ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
+              {
+                echo "# Combined archive"
+                echo ""
+                echo "**ZIP size:** ${ZIP_MB} MB"
+                echo ""
+                echo "[Download ZIP](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "${ZIP_NAME}"))"
+              } > "$FINAL_DIR/README.md"
+            fi
+            cd "$GITHUB_WORKSPACE"
+          fi
+
+          echo "Packaging completed. Folder: $FOLDER_NAME"
+          echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
 
       - name: Update README.md and push
         run: |
           BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          FOLDER_NAME="${{ env.FOLDER_NAME }}"
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ github.event.repository.name }}"
           BRANCH="${GITHUB_REF_NAME}"
           REPO_URL="${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
 
           mkdir -p downloads
-          if [ -d "$BACKUP_DIR" ] && [ "$(ls -A $BACKUP_DIR 2>/dev/null)" ]; then
-            cp -r "$BACKUP_DIR"/* downloads/
+          if [ -d "$BACKUP_DIR/$FOLDER_NAME" ]; then
+            cp -r "$BACKUP_DIR/$FOLDER_NAME" downloads/
+            echo "Copied folder to downloads/"
+          else
+            echo "Backup folder not found!"
+            exit 1
           fi
 
           urlencode() {
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
 
-          # ساخت فهرست کلی با نمایش فقط حجم ZIP
+          FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+
+          # یافتن حجم (ZIP یا قطعات)
+          if [ -f "downloads/$FOLDER_NAME/${FOLDER_NAME}.zip" ]; then
+            ARCHIVE_SIZE=$(stat -c%s "downloads/$FOLDER_NAME/${FOLDER_NAME}.zip")
+          elif ls downloads/$FOLDER_NAME/*.z[0-9]* 1>/dev/null 2>&1; then
+            ARCHIVE_SIZE=0
+            for p in downloads/$FOLDER_NAME/*.z*; do
+              ARCHIVE_SIZE=$(( ARCHIVE_SIZE + $(stat -c%s "$p") ))
+            done
+          else
+            ARCHIVE_SIZE=0
+          fi
+          ARCHIVE_MB=$(echo "scale=2; $ARCHIVE_SIZE/1048576" | bc)
+
+          # بازسازی فهرست کلی (downloads/README.md)
           {
             echo "# Downloaded list :"
             echo ""
-            for folder in downloads/*/; do
-              [ -d "$folder" ] || continue
-              FNAME=$(basename "$folder")
-              FENCODED=$(urlencode "$FNAME")
-              # تشخیص فایل ZIP (حالت zip یا split)
-              if [ -f "$folder/${FNAME}.zip" ]; then
-                ZIP_SIZE=$(stat -c%s "$folder/${FNAME}.zip")
-              elif ls "$folder"/*.z[0-9]* 1>/dev/null 2>&1; then
-                # حالت split: جمع کل قطعات
-                ZIP_SIZE=0
-                for p in "$folder"/*.z*; do
-                  [ -f "$p" ] && ZIP_SIZE=$((ZIP_SIZE + $(stat -c%s "$p")))
-                done
-              else
-                ZIP_SIZE=0
-              fi
-              ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
-              echo "- [${ZIP_MB} MB](./${FENCODED})"
-            done
+            echo "- [${ARCHIVE_MB} MB](./${FOLDER_ENCODED})"
             echo ""
             echo "---"
           } > downloads/README.md
@@ -414,23 +438,7 @@ jobs:
           sed -i '/^## Latest Downloads/,/^---$/d' README.md
           {
             echo "## Latest Downloads"
-            for folder in downloads/*/; do
-              [ -d "$folder" ] || continue
-              FNAME=$(basename "$folder")
-              FENCODED=$(urlencode "$FNAME")
-              if [ -f "$folder/${FNAME}.zip" ]; then
-                ZIP_SIZE=$(stat -c%s "$folder/${FNAME}.zip")
-              elif ls "$folder"/*.z[0-9]* 1>/dev/null 2>&1; then
-                ZIP_SIZE=0
-                for p in "$folder"/*.z*; do
-                  [ -f "$p" ] && ZIP_SIZE=$((ZIP_SIZE + $(stat -c%s "$p")))
-                done
-              else
-                ZIP_SIZE=0
-              fi
-              ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
-              echo "- [${ZIP_MB} MB](${REPO_URL}/${FENCODED})"
-            done
+            echo "- [${ARCHIVE_MB} MB](${REPO_URL}/${FOLDER_ENCODED})"
             echo "---"
           } >> README.md
 
