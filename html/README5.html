@@ -1,0 +1,61 @@
+<p align="center">
+  <img src="logo.png" alt="N-Queens Logo" width="150">
+</p>
+
+<h1>♛ N‑Queens Solver with Multiple Algorithms</h1>
+<p><a href="./README_fa.md"><strong>فارسی (Persian)</strong></a></p>
+
+<p>
+  An interactive N‑Queens solver supporting <strong>10 algorithms</strong> (DFS, Backtracking, BFS, IDDFS, UCS, A*, Hill Climbing, Simulated Annealing, Local Beam Search, Genetic Algorithm).<br />
+  View all solutions, unique solutions, or a single result. Animated board, dark mode, and fully bilingual (English &amp; Persian) — <strong>zero external dependencies</strong>.
+</p>
+
+<h2>📥 Download Executable (Windows)</h2>
+<p>
+  Ready‑to‑run <code>.exe</code> from the latest release:<br />
+  <a href="https://github.com/alirezaghavami/nqueens/releases/latest/download/nqueens.exe">🔽 Download nqueens.exe</a>
+</p>
+
+<h2>✨ Features</h2>
+<ul>
+  <li>Solve N‑Queens for any <strong>N ≥ 4</strong> (up to 14‑15 for practical use)</li>
+  <li><strong>10 algorithms</strong> – deterministic and stochastic</li>
+  <li>Find a single solution or <strong>all solutions</strong></li>
+  <li>Filter to <strong>unique solutions</strong> (symmetry‑reduced)</li>
+  <li>Animated chessboard with <strong>distinct queen colours</strong> option</li>
+  <li>Performance metrics (time, error rate for stochastic methods)</li>
+  <li>Algorithm explanation panel</li>
+  <li>Dark mode GUI, bilingual (English / Persian)</li>
+  <li>Zoomable board, auto‑play slideshow</li>
+</ul>
+
+<h2>🚀 How to Run from Source</h2>
+<ol>
+  <li>
+    <strong>Clone the repository</strong>:
+    <pre><code>git clone https://github.com/alirezaghavami/nqueens.git
+cd nqueens</code></pre>
+  </li>
+  <li>
+    <strong>Run the script</strong> (Python 3.7+ required):
+    <pre><code>python nqueens.py</code></pre>
+  </li>
+</ol>
+<p>No extra packages required — everything is in the Python standard library.</p>
+
+<h2>🔨 Build Your Own Executable (PyInstaller)</h2>
+<pre><code>pip install pyinstaller
+pyinstaller --onefile --windowed --add-data "locale;locale" --add-data "logo.png;." nqueens.py</code></pre>
+<ul>
+  <li>On <strong>Linux/macOS</strong> replace <code>;</code> with <code>:</code> in <code>--add-data</code>.</li>
+  <li>The output will be inside the <code>dist/</code> folder.</li>
+</ul>
+
+<h2>🌐 Language Switching</h2>
+<p>Press the <code>FA | EN</code> button in the top bar to toggle between English and Persian.</p>
+
+<h2>📄 License</h2>
+<p>MIT License — see the <code>LICENSE</code> file or the <strong>About</strong> window inside the application.</p>
+
+<hr />
+<p><strong>Made with ❤️ by Alireza Ghavami</strong></p>

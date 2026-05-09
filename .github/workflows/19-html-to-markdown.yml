@@ -1,0 +1,85 @@
+name: 🔄 Convert HTML to Markdown (dynamic)
+
+on:
+  workflow_dispatch:
+    inputs:
+      html_pattern:
+        description: 'Glob pattern for HTML files (e.g., **/*.html, readme_*.html)'
+        required: false
+        default: '**/*.html'
+        type: string
+
+jobs:
+  convert-html-to-md:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install Pandoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pandoc
+
+      - name: Convert all matching HTML files to Markdown
+        run: |
+          PATTERN="${{ github.event.inputs.html_pattern }}"
+          echo "Searching for HTML files matching: $PATTERN"
+
+          # Enable recursive globbing
+          shopt -s globstar nullglob
+          html_files=( $PATTERN )
+          echo "Found ${#html_files[@]} HTML file(s)."
+
+          for html in "${html_files[@]}"; do
+            # Skip if not a regular file
+            [[ -f "$html" ]] || continue
+
+            md="${html%.html}.md"
+            echo "Converting: $html → $md"
+            pandoc -f html -t gfm "$html" -o "$md"
+          done
+
+          echo "All conversions finished."
+
+      - name: Commit and push all generated Markdown files
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          BRANCH="${GITHUB_REF_NAME}"
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
+
+          # Stage all .md files that were newly created or modified
+          git add '*.md' '**/*.md'
+
+          if git diff --cached --quiet; then
+            echo "No changes to push."
+            exit 0
+          fi
+
+          git commit -m "📄 Convert HTML to Markdown [skip ci]"
+
+          # Retry logic for concurrent pushes
+          RETRY_MAX=10
+          for ((i=1; i<=RETRY_MAX; i++)); do
+            echo "Push attempt $i/$RETRY_MAX"
+            if git push origin HEAD:"$BRANCH" 2>&1; then
+              echo "Push successful!"
+              exit 0
+            else
+              WAIT=$((2 + RANDOM % 8))
+              echo "Push failed, retrying in ${WAIT}s..."
+              sleep $WAIT
+            fi
+          done
+
+          echo "All push attempts failed."
+          exit 1
