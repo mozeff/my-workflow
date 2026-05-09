@@ -17,6 +17,11 @@ on:
         required: false
         type: string
         default: '3'
+      randomize_delay:
+        description: 'Add random extra delay (0-1s) to the wait time to avoid bot detection'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   browse:
@@ -39,7 +44,7 @@ jobs:
           npm install puppeteer > /dev/null
 
       # ------------------------------------------------------------
-      # اسکریپت Puppeteer (شبیه نمونه‌ی Browse the Web)
+      # اسکریپت Puppeteer (با پشتیبانی از تأخیر تصادفی)
       # ------------------------------------------------------------
       - name: Create screenshot & HTML extractor script
         run: |
@@ -49,7 +54,10 @@ jobs:
           const url = process.argv[2];
           const screenshotPath = process.argv[3];
           const htmlPath = process.argv[4];
-          const waitSeconds = parseFloat(process.argv[5]) || 3; // پیش‌فرض ۳ ثانیه
+          const waitSecondsBase = parseFloat(process.argv[5]) || 3;
+
+          // خواندن گزینه تصادفی‌سازی از متغیر محیطی
+          const randomize = (process.env.RANDOMIZE_DELAY || 'false') === 'true';
 
           (async () => {
             const browser = await puppeteer.launch({
@@ -78,8 +86,16 @@ jobs:
                 });
               });
 
-              // زمان صبر قابل تنظیم توسط کاربر
-              console.log(`Waiting ${waitSeconds} seconds for lazy content to load...`);
+              // تعیین زمان انتظار نهایی
+              let waitSeconds = waitSecondsBase;
+              if (randomize) {
+                // اضافه کردن ۰ تا ۱ ثانیه تصادفی
+                waitSeconds = waitSecondsBase + Math.random();
+                console.log(`Randomizing delay: base=${waitSecondsBase}, actual=${waitSeconds.toFixed(2)}`);
+              } else {
+                console.log(`Waiting ${waitSeconds} seconds...`);
+              }
+
               await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
 
               await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -102,10 +118,11 @@ jobs:
       # ------------------------------------------------------------
       - name: Process each URL and collect all data
         shell: bash
+        env:
+          RANDOMIZE_DELAY: ${{ github.event.inputs.randomize_delay }}
         run: |
           set -euo pipefail
 
-          # تبدیل ورودی URLs به آرایه
           IFS=' ' read -ra URLS_ARRAY <<< "${{ github.event.inputs.urls }}"
 
           if [ ${#URLS_ARRAY[@]} -eq 0 ]; then
@@ -130,7 +147,6 @@ jobs:
             done
           }
 
-          # نام پوشه‌ی اصلی batch
           BATCH_FOLDER=$(get_unique_numeric_folder)
           BATCH_PATH="pages/$BATCH_FOLDER"
           mkdir -p "$BATCH_PATH"
@@ -139,15 +155,13 @@ jobs:
 
           TOTAL_URLS=${#URLS_ARRAY[@]}
           TOTAL_MEDIA=0
-          GLOBAL_IMG_COUNTER=0  # ★ شمارنده سراسری برای تصاویر
+          GLOBAL_IMG_COUNTER=0
 
-          # ساخت هدر README.md اصلی
           cat > "$BATCH_PATH/README.md" << 'README_HEADER'
           # 📸 Downloaded Images (in order)
           README_HEADER
           echo "" >> "$BATCH_PATH/README.md"
 
-          # ایجاد یک index کلی برای batch
           cat > "$BATCH_PATH/index.md" << INDEX_HEADER
           # Batch Session: $BATCH_FOLDER
           **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
@@ -156,11 +170,9 @@ jobs:
           ## Processed Sessions
           INDEX_HEADER
 
-          # پردازش هر URL
           for (( idx=0; idx<${TOTAL_URLS}; idx++ )); do
             RAW_URL="${URLS_ARRAY[$idx]}"
 
-            # افزودن پروتکل در صورت نیاز
             if [[ ! "$RAW_URL" =~ ^https?:// ]]; then
               HTTPS_URL="https://$RAW_URL"
               if curl -fsL --connect-timeout 10 --max-time 30 -o /dev/null "$HTTPS_URL" 2>/dev/null; then
@@ -172,7 +184,6 @@ jobs:
               URL="$RAW_URL"
             fi
 
-            # نام پوشه‌ی مخصوص همین URL
             URL_FOLDER=$(get_unique_numeric_folder)
             FOLDER="$BATCH_PATH/$URL_FOLDER"
             MEDIA_DIR="$FOLDER/media"
@@ -180,7 +191,6 @@ jobs:
 
             echo "🔄 [$((idx+1))/$TOTAL_URLS] Processing session ID: $URL_FOLDER"
 
-            # اسکرین‌شات و HTML (با دریافت wait_seconds از ورودی)
             SCREENSHOT_OK=false
             if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html" "${{ github.event.inputs.wait_seconds }}"; then
               SCREENSHOT_OK=true
@@ -193,12 +203,10 @@ jobs:
               }
             fi
 
-            # استخراج لینک‌های موجود در HTML
             grep -ohP '(?:href|src)="\K[^"]*' "$FOLDER/page.html" | sort -u > "$FOLDER/all_links.txt"
 
-            # فرمت‌های رسانه‌ای قابل دانلود
             MEDIA_EXT='png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|zip|rar|tar|gz|7z'
-            IMG_EXT='png|jpg|jpeg|gif|svg|webp'  # ★ فقط تصاویر
+            IMG_EXT='png|jpg|jpeg|gif|svg|webp'
 
             > "$FOLDER/media_links.txt"
             > "$FOLDER/other_links.txt"
@@ -230,7 +238,6 @@ jobs:
                   if [[ "$SIZE" -gt 0 ]]; then
                     echo "$link" >> "$FOLDER/media_links.txt"
                     if [[ "$ext_lower" =~ ^($IMG_EXT)$ ]]; then
-                      # ★ اضافه کردن به README عمومی با شماره ترتیب
                       GLOBAL_IMG_COUNTER=$((GLOBAL_IMG_COUNTER + 1))
                       echo "$GLOBAL_IMG_COUNTER. ![$SAFE_NAME](./$URL_FOLDER/media/$SAFE_NAME)" >> "$BATCH_PATH/README.md"
                       echo "![$SAFE_NAME](./media/$SAFE_NAME)" >> "$FOLDER/downloaded_media.md"
@@ -244,7 +251,6 @@ jobs:
               fi
             done < "$FOLDER/all_links.txt"
 
-            # ساخت index.md برای این URL
             MEDIA_COUNT=$(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l)
             {
               echo "# Session ID: $URL_FOLDER"
@@ -277,23 +283,19 @@ jobs:
               echo "- Media downloaded: $MEDIA_COUNT"
             } > "$FOLDER/index.md"
 
-            # اضافه کردن به index کلی batch
             echo "- **[$URL_FOLDER](./$URL_FOLDER/index.md)** — $MEDIA_COUNT media files" >> "$BATCH_PATH/index.md"
 
             TOTAL_MEDIA=$((TOTAL_MEDIA + MEDIA_COUNT))
           done
 
-          # پایان index batch
           echo "" >> "$BATCH_PATH/index.md"
           echo "## Overall Stats" >> "$BATCH_PATH/index.md"
           echo "- Total URLs: $TOTAL_URLS" >> "$BATCH_PATH/index.md"
           echo "- Total media files: $TOTAL_MEDIA" >> "$BATCH_PATH/index.md"
 
-          # ★ پایان README.md
           echo "" >> "$BATCH_PATH/README.md"
           echo "**Total images:** $GLOBAL_IMG_COUNTER" >> "$BATCH_PATH/README.md"
 
-          # ذخیره متغیرها برای مراحل بعد
           echo "BATCH_FOLDER=$BATCH_FOLDER" >> $GITHUB_ENV
           echo "TOTAL_URLS=$TOTAL_URLS" >> $GITHUB_ENV
           echo "TOTAL_MEDIA=$TOTAL_MEDIA" >> $GITHUB_ENV
@@ -332,7 +334,6 @@ jobs:
           TOTAL_URLS="${{ env.TOTAL_URLS }}"
           TOTAL_MEDIA="${{ env.TOTAL_MEDIA }}"
 
-          # به‌روزرسانی browse.md (شبیه نمونه‌ی اصلی)
           BROWSE_FILE="browse.md"
           if [[ ! -f "$BROWSE_FILE" ]]; then
             echo "# Browsed Websites" > "$BROWSE_FILE"

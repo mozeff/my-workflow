@@ -1,4 +1,4 @@
-name: 🖼️ Convert All SVGs to PNG
+name: 🖼️ tool-Convert All SVGs to PNG
 
 on:
   workflow_dispatch:

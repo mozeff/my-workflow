@@ -1,0 +1,201 @@
+name: Download Reddit Media (Direct)
+
+on:
+  workflow_dispatch:
+    inputs:
+      subreddit:
+        description: 'نام ساب‌ردیت (مثلاً aww)'
+        required: true
+        default: 'aww'
+      sort:
+        description: 'مرتب‌سازی (hot, new, top)'
+        required: true
+        default: 'hot'
+      skip:
+        description: 'چند پست اول رد شود'
+        required: true
+        default: '0'
+      count:
+        description: 'تعداد پستی که دریافت شود (حداکثر ۱۰۰)'
+        required: true
+        default: '10'
+      include_text:
+        description: 'متن پست هم ذخیره شود؟ (true/false)'
+        required: true
+        default: 'true'
+      include_link:
+        description: 'لینک پست هم ذخیره شود؟ (true/false)'
+        required: true
+        default: 'true'
+      max_height:
+        description: 'حداکثر ارتفاع (پیکسل) - 0 یعنی کاهش نده'
+        required: true
+        default: '0'
+      t:
+        description: 'بازه زمانی برای top (hour, day, week, month, year, all)'
+        required: false
+        default: 'day'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      # ======================================================
+      # مرحله ۱: دریافت توکن OAuth2 (در صورت وجود کلیدها)
+      # ======================================================
+      - name: 🔑 دریافت Access Token از Reddit
+        id: auth
+        env:
+          CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+        run: |
+          if [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ]; then
+            echo "🟢 استفاده از OAuth2"
+            RESPONSE=$(curl -s -X POST -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
+              -u "$CLIENT_ID:$CLIENT_SECRET" \
+              -d "grant_type=client_credentials" \
+              https://www.reddit.com/api/v1/access_token)
+            TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+            if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
+              echo "❌ خطا در دریافت توکن: $RESPONSE"
+              exit 1
+            fi
+            echo "ACCESS_TOKEN=$TOKEN" >> $GITHUB_ENV
+          else
+            echo "🟡 استفاده از حالت عمومی (بدون OAuth2)"
+            echo "ACCESS_TOKEN=" >> $GITHUB_ENV
+          fi
+
+      # ======================================================
+      # مرحله ۲: دریافت لیست پست‌ها از Reddit API
+      # ======================================================
+      - name: 📥 دریافت پست‌ها
+        id: fetch
+        run: |
+          SUBREDDIT="${{ github.event.inputs.subreddit }}"
+          SORT="${{ github.event.inputs.sort }}"
+          SKIP="${{ github.event.inputs.skip }}"
+          LIMIT="${{ github.event.inputs.count }}"
+          T="${{ github.event.inputs.t }}"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+          TOTAL=$((SKIP + LIMIT))
+          if [ -n "$ACCESS_TOKEN" ]; then
+            API_URL="https://oauth.reddit.com/r/${SUBREDDIT}/${SORT}.json?limit=${TOTAL}&t=${T}&raw_json=1"
+            curl -sS -H "Authorization: Bearer $ACCESS_TOKEN" -H "User-Agent: $UA" "$API_URL" -o raw.json
+          else
+            API_URL="https://www.reddit.com/r/${SUBREDDIT}/${SORT}.json?limit=${TOTAL}&t=${T}&raw_json=1"
+            curl -sS -H "User-Agent: $UA" "$API_URL" -o raw.json
+          fi
+
+          # پردازش و فیلتر
+          jq '[.data.children[].data]' raw.json > all_posts.json
+
+          # حذف پست‌های چسبنده و تبلیغاتی
+          jq '[.[] | select(.stickied == false and .is_ad == false)]' all_posts.json > filtered.json
+
+          # نگه‌داشتن پست‌هایی که حداقل یک رسانه دارند
+          jq '[.[] | select(
+            (.is_gallery == true and .media_metadata != null) or
+            (.post_hint == "image") or
+            (.post_hint == "hosted:video") or
+            (.url | test("\\.(jpg|jpeg|png|gif|mp4|webm|mov)(\\?.*)?$"; "i"))
+          )]' filtered.json > media_posts.json
+
+          # اعمال skip و limit
+          jq ".[$SKIP:$((SKIP+LIMIT))]" media_posts.json > posts.json
+
+          echo "📄 تعداد پست‌های نهایی: $(jq length posts.json)"
+
+      # ======================================================
+      # مرحله ۳: استخراج متن و لینک (در صورت درخواست)
+      # ======================================================
+      - name: 📝 ذخیره متن و لینک
+        if: ${{ github.event.inputs.include_text == 'true' || github.event.inputs.include_link == 'true' }}
+        run: |
+          jq -r '.[] |
+            "---\nTitle: \(.title)\n" +
+            (if "'${{ github.event.inputs.include_text }}'" == "true" then "Selftext: \(.selftext // "N/A")\n" else "" end) +
+            (if "'${{ github.event.inputs.include_link }}'" == "true" then "Link: https://www.reddit.com\(.permalink)\n" else "" end) +
+            "---"' posts.json > posts_summary.txt
+
+      # ======================================================
+      # مرحله ۴: نصب ابزارهای تبدیل (ffmpeg, imagemagick)
+      # ======================================================
+      - name: 🛠️ نصب ابزارهای چندرسانه‌ای
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg imagemagick
+
+      # ======================================================
+      # مرحله ۵: استخراج تمام URLهای رسانه و دانلود
+      # ======================================================
+      - name: 🖼️ استخراج و دانلود فایل‌های رسانه
+        run: |
+          mkdir -p downloads
+          # استخراج URL تمام رسانه‌ها (گالری، ویدئو، عکس)
+          jq -r '.[] |
+            [
+              # گالری‌ها
+              (select(.is_gallery) | .media_metadata | to_entries[].value |
+                (if .p then (.p[-1].u) else (.s.u) end) ),
+              # ویدئوی reddit
+              (select(.media.reddit_video) | .media.reddit_video.fallback_url),
+              # عکس مستقیم
+              (select(.post_hint == "image") | .url),
+              # لینک مستقیم دیگر
+              (select(.url | test("\\.(jpg|jpeg|png|gif|mp4|webm|mov)(\\?.*)?$"; "i")) | .url)
+            ] | .[]' posts.json | while read url; do
+            if [ -n "$url" ]; then
+              echo "📡 Downloading: $url"
+              wget --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
+                   --tries=3 --waitretry=5 --random-wait \
+                   -q -P downloads "$url" || echo "⚠️ دانلود نشد: $url"
+              # تأخیر تصادفی ۱ تا ۴ ثانیه
+              sleep $(( RANDOM % 4 + 1 ))
+            fi
+          done
+          echo "✅ دانلود پایان یافت. فایل‌ها: $(ls downloads | wc -l)"
+
+      # ======================================================
+      # مرحله ۶: کاهش رزولوشن (در صورت درخواست)
+      # ======================================================
+      - name: 🔄 کاهش ابعاد (اختیاری)
+        if: ${{ github.event.inputs.max_height != '0' && github.event.inputs.max_height != '' }}
+        run: |
+          MAX_HEIGHT="${{ github.event.inputs.max_height }}"
+          echo "🔧 کاهش به ارتفاع ≤ ${MAX_HEIGHT}px"
+          cd downloads
+          for file in *; do
+            [ -f "$file" ] || continue
+            ext="${file##*.}"
+            ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+            case "$ext_lower" in
+              jpg|jpeg|png|gif|webp|bmp)
+                height=$(identify -format "%h" "$file" 2>/dev/null)
+                if [ -n "$height" ] && [ "$height" -gt "$MAX_HEIGHT" ]; then
+                  echo "🖼️ Resizing $file (${height}px -> ${MAX_HEIGHT}px)"
+                  mogrify -resize x${MAX_HEIGHT} "$file"
+                fi
+                ;;
+              mp4|webm|mov|mkv|avi)
+                height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$file" 2>/dev/null)
+                if [ -n "$height" ] && [ "$height" -gt "$MAX_HEIGHT" ]; then
+                  echo "🎞️ Transcoding $file (${height}px -> ${MAX_HEIGHT}px)"
+                  ffmpeg -y -i "$file" -vf "scale=-2:${MAX_HEIGHT}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "tmp_${file}" 2>/dev/null
+                  mv "tmp_${file}" "$file"
+                fi
+                ;;
+            esac
+          done
+          echo "✅ کاهش ابعاد تمام شد."
+
+      # ======================================================
+      # مرحله ۷: ذخیره در Artifact
+      # ======================================================
+      - name: 📦 آپلود نتیجه
+        uses: actions/upload-artifact@v4
+        with:
+          name: reddit-media-${{ github.run_id }}
+          path: |
+            downloads/
+            posts.json
+            posts_summary.txt
