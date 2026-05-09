@@ -23,12 +23,12 @@ on:
         description: 'Save post text?'
         required: true
         type: boolean
-        default: true
+        default: false
       include_link:
         description: 'Save post link?'
         required: true
         type: boolean
-        default: true
+        default: false
       max_height:
         description: 'Maximum height (pixels) – 0 means no resize'
         required: true
@@ -42,6 +42,11 @@ on:
         required: false
         type: string
         default: ''
+      zip_compression:
+        description: 'Compression level (0=store, 1=fastest, 9=best)'
+        required: false
+        type: number
+        default: 6
 
 jobs:
   download:
@@ -120,7 +125,7 @@ jobs:
             (if "'${{ github.event.inputs.include_link }}'" == "true" then "Link: https://www.reddit.com\(.permalink)\n" else "" end) +
             "---"' posts.json > posts_summary.txt
 
-      # Step 4: Install media tools (ffmpeg, imagemagick)
+      # Step 4: Install media tools (ffmpeg, imagemagick, zip)
       - name: 🛠️ Install Multimedia Tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg imagemagick zip
 
@@ -183,17 +188,24 @@ jobs:
           done
           echo "✅ Resizing complete."
 
-      # Step 7: Package outputs into a ZIP archive (with optional encryption)
+      # Step 7: Package outputs into a ZIP archive (with optional encryption and compression level)
       - name: 📦 Create ZIP Archive
         if: success()
         run: |
           ZIP_NAME="reddit_media_${{ github.run_id }}.zip"
+          ZIP_LEVEL="${{ github.event.inputs.zip_compression }}"
+          # Validate compression level (0-9), fallback to 6 if out of range
+          if ! [[ "$ZIP_LEVEL" =~ ^[0-9]$ ]]; then
+            echo "⚠️ Invalid compression level '$ZIP_LEVEL', using default (6)"
+            ZIP_LEVEL=6
+          fi
+
           if [ -n "${{ github.event.inputs.zip_password }}" ]; then
-            echo "🔐 Creating encrypted ZIP..."
-            zip -qr -P "${{ github.event.inputs.zip_password }}" "$ZIP_NAME" downloads posts.json posts_summary.txt
+            echo "🔐 Creating encrypted ZIP (compression level $ZIP_LEVEL)..."
+            zip -q -r -"$ZIP_LEVEL" -P "${{ github.event.inputs.zip_password }}" "$ZIP_NAME" downloads posts.json posts_summary.txt
           else
-            echo "📦 Creating unencrypted ZIP..."
-            zip -qr "$ZIP_NAME" downloads posts.json posts_summary.txt
+            echo "📦 Creating unencrypted ZIP (compression level $ZIP_LEVEL)..."
+            zip -q -r -"$ZIP_LEVEL" "$ZIP_NAME" downloads posts.json posts_summary.txt
           fi
           echo "ZIP_FILE=$ZIP_NAME" >> $GITHUB_ENV
           echo "✅ ZIP archive created: $ZIP_NAME"

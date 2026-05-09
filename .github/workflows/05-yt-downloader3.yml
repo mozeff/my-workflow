@@ -42,6 +42,11 @@ on:
         required: false
         default: false
         type: boolean
+      strict_quality:
+        description: 'Fail if exact quality is unavailable (otherwise fallback to best ≤ requested)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   download-youtube:
@@ -103,6 +108,59 @@ jobs:
           deno --version
           pip3 install --upgrade yt-dlp
 
+      # ─────────────────────────────────────────────────────────
+      # مرحله ۱: پیش‌بررسی کیفیت‌های موجود (Option 3)
+      # ─────────────────────────────────────────────────────────
+      - name: Pre-check available video qualities
+        id: quality_check
+        run: |
+          set -euo pipefail
+          URL="${{ github.event.inputs.youtube_url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          AUDIO_ONLY="${{ github.event.inputs.audio_only }}"
+          COOKIES_FILE=""
+          if [ "${{ github.event.inputs.use_cookies }}" = "true" ] && [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
+            echo "${{ secrets.YOUTUBE_COOKIES }}" > ./cookies.txt
+            COOKIES_FILE="--cookies ./cookies.txt"
+          fi
+
+          # صوت یا best نیازی به بررسی ارتفاع ندارد
+          if [ "$AUDIO_ONLY" = "true" ] || [ "$QUALITY" = "best" ]; then
+            echo "No height check needed (audio or best)."
+            echo "use_exact=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # با iOS client + WARP probe می‌کنیم (بیشترین کیفیت‌ها را نشان می‌دهد)
+          PROXY="--proxy socks5://127.0.0.1:1080"
+          UA="--user-agent 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'"
+          CLIENT="--extractor-args youtube:player_client=ios"
+
+          echo "🔍 Checking available formats (iOS client + WARP)..."
+          # دریافت ارتفاع‌های یکتای غیرصوتی
+          FORMAT_LIST=$(yt-dlp $PROXY $UA $CLIENT $COOKIES_FILE \
+            --no-playlist --no-check-certificates \
+            --print "%(height)s" "$URL" 2>/dev/null | sort -n | uniq | grep -v '^$' || true)
+
+          if echo "$FORMAT_LIST" | grep -qx "$QUALITY"; then
+            echo "✅ Quality ${QUALITY}p is available!"
+            echo "use_exact=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Quality ${QUALITY}p NOT found. Available heights: $FORMAT_LIST"
+            echo "use_exact=false" >> $GITHUB_OUTPUT
+            # حدس دلیل
+            if yt-dlp -F $PROXY $UA $CLIENT $COOKIES_FILE "$URL" 2>&1 | grep -qi "SABR"; then
+              echo "::warning::SABR might be limiting formats."
+            elif yt-dlp -F $PROXY $UA $CLIENT $COOKIES_FILE "$URL" 2>&1 | grep -qi "sign in to confirm your age"; then
+              echo "::warning::Video is age-restricted. Cookies may be required."
+            else
+              echo "::warning::Exact height unavailable (geo/age/client restriction)."
+            fi
+          fi
+
+      # ─────────────────────────────────────────────────────────
+      # مرحله ۲: دانلود (Option 1 + Option 2 با توجه به نتیجه پیش‌بررسی)
+      # ─────────────────────────────────────────────────────────
       - name: Download YouTube video/audio
         run: |
           set -euo pipefail
@@ -113,6 +171,8 @@ jobs:
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
           USE_COOKIES="${{ github.event.inputs.use_cookies }}"
           YOUTUBE_COOKIES_SECRET="${{ secrets.YOUTUBE_COOKIES }}"
+          STRICT="${{ github.event.inputs.strict_quality }}"
+          USE_EXACT="${{ steps.quality_check.outputs.use_exact }}"
           SPLIT_MB=90
           SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
 
@@ -138,30 +198,47 @@ jobs:
             [ "$USE_COOKIES" = "true" ] && echo "WARNING: use_cookies is ON but secret is empty."
           fi
 
-          echo "Downloading: $URL (Audio=$AUDIO_ONLY, Quality=$QUALITY, Cookies=$COOKIES_STATUS)"
+          echo "Downloading: $URL (Audio=$AUDIO_ONLY, Quality=$QUALITY, Cookies=$COOKIES_STATUS, Strict=$STRICT)"
 
           sanitize_name() { echo "$1" | sed 's/ /-/g; s/　/-/g' | tr -s '-'; }
           urlencode() { python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
 
+          # ─── انتخاب فرمت ────────────────────────────────
           if [ "$AUDIO_ONLY" = "true" ]; then
             FORMAT="bestaudio/best"
-            MERGE_FLAG=""
-            DOWNLOAD_TYPE="audio"
           else
-            case "$QUALITY" in
-              144)  FORMAT="bestvideo[height<=144]+bestaudio/best[height<=144]/best" ;;
-              240)  FORMAT="bestvideo[height<=240]+bestaudio/best[height<=240]/best" ;;
-              360)  FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]/best" ;;
-              480)  FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]/best" ;;
-              720)  FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]/best" ;;
-              1080) FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]/best" ;;
-              1440) FORMAT="bestvideo[height<=1440]+bestaudio/best[height<=1440]/best" ;;
-              2160) FORMAT="bestvideo[height<=2160]+bestaudio/best[height<=2160]/best" ;;
-              best)  FORMAT="bestvideo+bestaudio/best" ;;
-              *)     FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]/best" ;;
-            esac
-            MERGE_FLAG=""
-            DOWNLOAD_TYPE="video"
+            if [ "$USE_EXACT" = "true" ] && [ "$QUALITY" != "best" ]; then
+              # Option 1: exact match – no fallback
+              case "$QUALITY" in
+                144)  FORMAT="bestvideo[height=144]+bestaudio/best[height=144]" ;;
+                240)  FORMAT="bestvideo[height=240]+bestaudio/best[height=240]" ;;
+                360)  FORMAT="bestvideo[height=360]+bestaudio/best[height=360]" ;;
+                480)  FORMAT="bestvideo[height=480]+bestaudio/best[height=480]" ;;
+                720)  FORMAT="bestvideo[height=720]+bestaudio/best[height=720]" ;;
+                1080) FORMAT="bestvideo[height=1080]+bestaudio/best[height=1080]" ;;
+                1440) FORMAT="bestvideo[height=1440]+bestaudio/best[height=1440]" ;;
+                2160) FORMAT="bestvideo[height=2160]+bestaudio/best[height=2160]" ;;
+                *)    echo "Unknown quality"; exit 1 ;;
+              esac
+            else
+              # Option 2: fallback (≤) if strict is off, else abort
+              if [ "$STRICT" = "true" ] && [ "$USE_EXACT" = "false" ]; then
+                echo "🚫 Strict mode: quality ${QUALITY}p not available. Aborting."
+                exit 1
+              fi
+              case "$QUALITY" in
+                144)  FORMAT="bestvideo[height<=144]+bestaudio/best[height<=144]/best" ;;
+                240)  FORMAT="bestvideo[height<=240]+bestaudio/best[height<=240]/best" ;;
+                360)  FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]/best" ;;
+                480)  FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]/best" ;;
+                720)  FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]/best" ;;
+                1080) FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]/best" ;;
+                1440) FORMAT="bestvideo[height<=1440]+bestaudio/best[height<=1440]/best" ;;
+                2160) FORMAT="bestvideo[height<=2160]+bestaudio/best[height<=2160]/best" ;;
+                best)  FORMAT="bestvideo+bestaudio/best" ;;
+                *)     echo "Unknown quality"; exit 1 ;;
+              esac
+            fi
           fi
 
           COMMON_FLAGS="--output tmp_downloads/%(title)s.%(ext)s --no-part --no-playlist --retries 10 --fragment-retries 10 --no-check-certificates $COOKIES_FLAG"
