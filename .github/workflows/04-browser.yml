@@ -71,7 +71,6 @@ jobs:
             try {
               await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-              // اسکرول برای بارگذاری تنبل (همیشه انجام شود، حتی اگر اسکرین‌شات نگیریم)
               await page.evaluate(async () => {
                 await new Promise((resolve) => {
                   let totalHeight = 0;
@@ -88,13 +87,11 @@ jobs:
               });
               await page.waitForTimeout(2000);
 
-              // اسکرین‌شات فقط در صورت درخواست
               if (doScreenshot) {
                 await page.screenshot({ path: screenshotPath, fullPage: true });
                 console.log('Screenshot saved successfully');
               }
 
-              // استخراج HTML رندر شده (همیشه)
               const html = await page.content();
               fs.writeFileSync(htmlPath, html);
               console.log('Rendered HTML saved successfully');
@@ -126,7 +123,6 @@ jobs:
             URL="$RAW_URL"
           fi
 
-          # --- توابع تولید نام تصادفی عددی ---
           generate_random_numeric_name() {
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
@@ -154,7 +150,6 @@ jobs:
           SCREENSHOT_OK=false
           HTML_OK=false
 
-          # تصمیم‌گیری درباره نیاز به Puppeteer
           NEED_PUPPETEER=false
           if [ "$INCLUDE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_MEDIA" = "true" ]; then
             NEED_PUPPETEER=true
@@ -176,7 +171,6 @@ jobs:
               }
             fi
           else
-            # بدون نیاز به Puppeteer، فقط raw HTML دانلود می‌شود
             echo "Skipping Puppeteer, downloading raw HTML with curl."
             curl -sSL -A "Mozilla/5.0" -o "$FOLDER/page.html" "$URL" || {
               echo "Failed to download HTML, creating placeholder"
@@ -184,7 +178,6 @@ jobs:
             }
           fi
 
-          # استخراج و دانلود مدیا فقط در صورت فعال بودن
           if [ "$DOWNLOAD_MEDIA" = "true" ]; then
             echo "Extracting and downloading media files..."
             grep -ohP '(?:href|src)="\K[^"]*' "$FOLDER/page.html" | sort -u > "$FOLDER/all_links.txt"
@@ -239,14 +232,13 @@ jobs:
             echo "Media downloaded: $MEDIA_COUNT files"
           else
             MEDIA_COUNT=0
-            # ایجاد فایل‌های خالی برای جلوگیری از خطا
             touch "$FOLDER/all_links.txt"
             echo "" > "$FOLDER/downloaded_media.md"
           fi
 
-          # ساخت index.md
+          # ساخت index.md داخل پوشه (درون ZIP باقی می‌ماند، اما برای browse.md مهم نیست)
           {
-            echo "# Session ID: $FOLDER_NAME"
+            echo "# Downloaded page"
             echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo ""
             if $SCREENSHOT_OK && [[ -f "$FOLDER/screenshot.png" ]]; then
@@ -278,15 +270,9 @@ jobs:
             echo "- Media downloaded: $MEDIA_COUNT"
           } > "$FOLDER/index.md"
 
-          # اصلاح browse.md
-          BROWSE_FILE="browse.md"
-          if [[ ! -f "$BROWSE_FILE" ]]; then
-            echo "# Browsed Websites" > "$BROWSE_FILE"
-            echo "" >> "$BROWSE_FILE"
-          fi
-          echo "- [${FOLDER_NAME}](./pages/${FOLDER_NAME}.md) — $MEDIA_COUNT media files" >> "$BROWSE_FILE"
-
+          # دیگر browse.md را به‌روز نمی‌کنیم – این کار پس از بسته‌بندی انجام می‌شود
           echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
+          echo "DATE_UTC=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
           echo "Session complete."
 
       - name: Package and optionally split
@@ -296,8 +282,8 @@ jobs:
           SPLIT_SIZE_MB: ${{ github.event.inputs.split_size }}
         run: |
           FOLDER_NAME="${{ env.FOLDER_NAME }}"
+          DATE_UTC="${{ env.DATE_UTC }}"
           SPLIT_SIZE_MB="${SPLIT_SIZE_MB:-0}"
-          # اگر 0 یا غیرعددی باشد، split انجام نشود
           if ! [[ "$SPLIT_SIZE_MB" =~ ^[0-9]+$ ]] || [ "$SPLIT_SIZE_MB" -le 0 ]; then
             SPLIT_SIZE_MB=0
           fi
@@ -311,7 +297,6 @@ jobs:
           TOTAL_SIZE=$(du -sb "$FOLDER_NAME" | cut -f1)
           ZIP_NAME="${FOLDER_NAME}.zip"
 
-          # تابع urlencode
           urlencode() {
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
@@ -323,10 +308,13 @@ jobs:
             else
               zip -s ${SPLIT_SIZE_MB}m -r "${ZIP_NAME}" "$FOLDER_NAME"
             fi
-            # پارت‌ها: .zip , .z01, .z02, ...
-            PARTS=$(ls ${FOLDER_NAME}.z* ${ZIP_NAME} 2>/dev/null | sort)
-            echo "Split archive parts:"
-            echo "$PARTS"
+            PARTS=$(ls ${FOLDER_NAME}.z[0-9]* ${ZIP_NAME} 2>/dev/null | sort)
+            # محاسبه حجم کل قطعات
+            TOTAL_ARCHIVE_SIZE=0
+            for part in $PARTS; do
+              TOTAL_ARCHIVE_SIZE=$((TOTAL_ARCHIVE_SIZE + $(stat -c%s "$part")))
+            done
+            SIZE_MB=$(echo "scale=2; $TOTAL_ARCHIVE_SIZE/1048576" | bc)
           else
             echo "Creating single zip (no split)..."
             if [ -n "$ZIP_PASSWORD" ]; then
@@ -335,22 +323,22 @@ jobs:
               zip -qr "${ZIP_NAME}" "$FOLDER_NAME"
             fi
             PARTS="${ZIP_NAME}"
+            TOTAL_ARCHIVE_SIZE=$(stat -c%s "${ZIP_NAME}")
+            SIZE_MB=$(echo "scale=2; $TOTAL_ARCHIVE_SIZE/1048576" | bc)
           fi
 
-          # حذف پوشه اصلی
           rm -rf "$FOLDER_NAME"
 
-          # ساخت فایل .md برای اطلاع‌رسانی و لینک‌ها
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ github.event.repository.name }}"
           BRANCH="${GITHUB_REF_NAME}"
           BASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${BRANCH}/pages"
-          FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
 
+          # تولید صفحهٔ جلسه (pages/FOLDER_NAME.md) با فقط حجم و لینک دانلود
           {
-            echo "# Session: $FOLDER_NAME"
+            echo "# Downloaded page"
             echo ""
-            echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "**Date:** ${DATE_UTC}"
             echo ""
             echo "## Download"
             echo ""
@@ -365,9 +353,13 @@ jobs:
                 i=$((i+1))
               done
               echo ""
+              echo "**Total size:** ${SIZE_MB} MB"
+              echo ""
               echo "**To extract:** Download all parts and open \`${ZIP_NAME}\` with 7-Zip or WinRAR."
             else
               echo "Single archive: [${ZIP_NAME}](${BASE_URL}/$(urlencode "${ZIP_NAME}"))"
+              echo ""
+              echo "**Size:** ${SIZE_MB} MB"
             fi
             if [ -n "$ZIP_PASSWORD" ]; then
               echo ""
@@ -377,6 +369,14 @@ jobs:
             echo "---"
             echo "*Generated by GitHub Actions*"
           } > "${FOLDER_NAME}.md"
+
+          # به‌روزرسانی browse.md با فقط حجم
+          BROWSE_FILE="../browse.md"
+          if [[ ! -f "$BROWSE_FILE" ]]; then
+            echo "# Browsed Websites" > "$BROWSE_FILE"
+            echo "" >> "$BROWSE_FILE"
+          fi
+          echo "- [${SIZE_MB} MB](./pages/${FOLDER_NAME}.md)" >> "$BROWSE_FILE"
 
           cd "$GITHUB_WORKSPACE"
 
