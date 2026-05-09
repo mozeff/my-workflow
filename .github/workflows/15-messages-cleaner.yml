@@ -1,4 +1,4 @@
-name: 🗑 13-Clean Channel Messages folder
+name: 🗑 14-Clean Channel Messages folder
 
 on:
   workflow_dispatch:
