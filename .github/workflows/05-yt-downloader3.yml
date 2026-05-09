@@ -200,6 +200,13 @@ jobs:
 
           echo "Downloading: $URL (Audio=$AUDIO_ONLY, Quality=$QUALITY, Cookies=$COOKIES_STATUS, Strict=$STRICT)"
 
+          # ─── NEW: تعیین نوع دانلود ───
+          if [ "$AUDIO_ONLY" = "true" ]; then
+            DOWNLOAD_TYPE="audio"
+          else
+            DOWNLOAD_TYPE="video"
+          fi
+
           sanitize_name() { echo "$1" | sed 's/ /-/g; s/　/-/g' | tr -s '-'; }
           urlencode() { python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
 
