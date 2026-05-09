@@ -25,6 +25,11 @@ on:
         required: false
         default: ''
         type: string
+      split_size:
+        description: 'حداکثر حجم هر پارت (MB) - اگر فایل بزرگتر باشد split می‌شود (پیش‌فرض ۸۰)'
+        required: false
+        default: '80'
+        type: string
 
 jobs:
   fetch:
@@ -87,7 +92,6 @@ jobs:
               process.exit(1);
             }
 
-            // Get desired count from env, fallback to 10
             let wantedCount = parseInt(process.env.COUNT, 10);
             if (isNaN(wantedCount) || wantedCount < 1) {
               console.warn(`Invalid message_count "${process.env.COUNT}", using 10.`);
@@ -124,7 +128,7 @@ jobs:
           EOF
           node fetch.js
 
-      - name: Prepare and package
+      - name: Prepare, package and split if needed
         id: prepare
         run: |
           PASS="${{ github.event.inputs.password }}"
@@ -133,22 +137,153 @@ jobs:
           COUNT="${{ github.event.inputs.message_count }}"
           TS=$(date +%Y%m%d_%H%M%S)
 
-          # ساخت پوشه مقصد با درج تعداد پیام‌ها در نام
+          # مقدار split_size از ورودی کاربر (با اعتبارسنجی ساده)
+          SPLIT_MB=${{ github.event.inputs.split_size }}
+          if ! [[ "$SPLIT_MB" =~ ^[0-9]+$ ]] || [ "$SPLIT_MB" -le 0 ]; then
+            echo "مقدار split_size نامعتبر است، از ۸۰ استفاده می‌شود."
+            SPLIT_MB=80
+          fi
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
           DIR="channel_messages/${SLUG}_${TS}_${COUNT}"
           mkdir -p "$DIR"
 
+          # متغیر برای نگهداری نام فایل نهایی (بسته یا تکی) و لیست پارت‌ها
+          ARCHIVE_NAME=""
+          PARTS_LIST=""
+
           if [ "$ZIP_OPTION" = "zip" ]; then
+            ARCHIVE_NAME="output.7z"
             if [ -n "$PASS" ]; then
-              7z a -p"${PASS}" -mhe=on "${DIR}/output.7z" messages.txt screenshot.png
+              7z a -p"${PASS}" -mhe=on "${DIR}/${ARCHIVE_NAME}" messages.txt screenshot.png
             else
-              7z a "${DIR}/output.7z" messages.txt screenshot.png
+              7z a "${DIR}/${ARCHIVE_NAME}" messages.txt screenshot.png
+            fi
+            # بررسی اندازه
+            SIZE=$(stat -c%s "${DIR}/${ARCHIVE_NAME}")
+            if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
+              echo "حجم فایل 7z بیشتر از ${SPLIT_MB}MB است. در حال split..."
+              cd "$DIR"
+              # حذف فایل اصلی بعد از split
+              7z a -v${SPLIT_MB}m ${ARCHIVE_NAME} ${ARCHIVE_NAME}
+              # حالا فایل‌های output.7z.001 و ... ایجاد شده‌اند
+              # فایل اصلی output.7z (که split نشده) حذف می‌شود چون 7z -v آن را نمی‌سازد
+              # فهرست پارت‌ها را ذخیره می‌کنیم
+              ls output.7z.* > /tmp/parts_list.txt
+              cd ../..
+              PARTS_LIST=$(cat "$DIR"/parts_list.txt 2>/dev/null || true)
+            else
+              PARTS_LIST="${ARCHIVE_NAME}"
             fi
           else
+            # حالت no_zip
             cp messages.txt screenshot.png "$DIR"/
+            # محاسبه مجموع حجم فایل‌ها
+            TOTAL_SIZE=0
+            for f in "$DIR"/*; do
+              [ -f "$f" ] && TOTAL_SIZE=$((TOTAL_SIZE + $(stat -c%s "$f")))
+            done
+            if [ "$TOTAL_SIZE" -gt "$SPLIT_BYTES" ]; then
+              echo "حجم فایل‌های بدون فشرده‌سازی بیشتر از ${SPLIT_MB}MB است. در حال split..."
+              cd "$DIR"
+              # یک tar از فایل‌ها می‌سازیم و سپس split می‌کنیم (تا همه فایل‌ها با هم بسته شوند)
+              tar -cf bundle.tar messages.txt screenshot.png
+              split -b ${SPLIT_MB}m -d --additional-suffix=.part bundle.tar bundle.tar.
+              rm bundle.tar messages.txt screenshot.png
+              ls bundle.tar.* > /tmp/parts_list.txt
+              cd ../..
+              PARTS_LIST=$(cat "$DIR"/parts_list.txt 2>/dev/null || true)
+            else
+              PARTS_LIST=$(ls "$DIR")
+            fi
           fi
 
           # پاکسازی فایل‌های موقت
           rm -f messages.txt screenshot.png
+
+          # ذخیره اطلاعات برای مرحله بعد
+          echo "split_size_mb=$SPLIT_MB" >> $GITHUB_ENV
+          echo "dir=$DIR" >> $GITHUB_ENV
+          echo "parts_list=$PARTS_LIST" >> $GITHUB_ENV
+          echo "zip_option=$ZIP_OPTION" >> $GITHUB_ENV
+          echo "password=$PASS" >> $GITHUB_ENV
+
+      - name: Generate README with download links
+        run: |
+          DIR="${{ env.dir }}"
+          SPLIT_MB="${{ env.split_size_mb }}"
+          PASS="${{ env.password }}"
+          ZIP_OPTION="${{ env.zip_option }}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          FOLDER_NAME=$(basename "$DIR")
+          FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+          RAW_BASE="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${BRANCH}/channel_messages/${FOLDER_ENCODED}"
+
+          PARTS_LIST="${{ env.parts_list }}"
+
+          {
+            echo "# 📥 پیام‌های کانال"
+            echo ""
+            echo "**پوشه:** \`${FOLDER_NAME}\`"
+            echo "**تعداد پیام‌ها:** ${{ github.event.inputs.message_count }}"
+            echo "**رمز فشرده:** $([ -n "$PASS" ] && echo '✅ بله' || echo '❌ خیر')"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 📦 فایل‌های موجود"
+            echo ""
+            if [ -z "$PARTS_LIST" ]; then
+              echo "فایلی یافت نشد!"
+            else
+              # بررسی اینکه split شده یا نه
+              if echo "$PARTS_LIST" | grep -q '\.' && (echo "$PARTS_LIST" | grep -q '\.7z\.' || echo "$PARTS_LIST" | grep -q '\.tar\.'); then
+                echo "فایل‌ها به **${SPLIT_MB}MB** پارت تقسیم شده‌اند:"
+                echo ""
+                echo "| # | نام فایل | لینک دانلود |"
+                echo "|---|----------|-------------|"
+                I=1
+                for PART in $PARTS_LIST; do
+                  PART_ENC=$(urlencode "$PART")
+                  echo "| $I | \`$PART\` | [📥 دانلود](${RAW_BASE}/${PART_ENC}) |"
+                  I=$((I+1))
+                done
+                echo ""
+                echo "### 🛠️ روش ترکیب دوباره"
+                if echo "$PART" | grep -q '7z'; then
+                  echo "۱. همه پارت‌ها را دانلود کنید."
+                  echo "۲. با 7-Zip روی \`.7z.001\` راست‌کلیک کرده و Extract Here را بزنید."
+                  [ -n "$PASS" ] && echo "۳. در صورت درخواست رمز، آن را وارد کنید."
+                else
+                  BUNDLE_NAME="bundle.tar"
+                  echo "۱. همه پارت‌ها را دانلود کنید."
+                  echo "۲. در ترمینال دستور زیر را اجرا کنید:"
+                  echo "\`\`\`bash"
+                  echo "cat ${BUNDLE_NAME}.*.part > ${BUNDLE_NAME}"
+                  echo "tar -xf ${BUNDLE_NAME}"
+                  echo "\`\`\`"
+                fi
+              else
+                echo "فایل(ها) بدون split:"
+                echo ""
+                for FILE in $PARTS_LIST; do
+                  FILE_ENC=$(urlencode "$FILE")
+                  echo "- [\`$FILE\`](${RAW_BASE}/${FILE_ENC})"
+                done
+              fi
+            fi
+            echo ""
+            echo "---"
+            echo "*تولید خودکار توسط GitHub Actions*"
+          } > "${DIR}/README.md"
+
+          echo "✅ README created."
 
       - name: Commit and push
         run: |

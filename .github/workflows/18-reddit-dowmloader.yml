@@ -47,12 +47,49 @@ on:
         required: false
         type: number
         default: 6
+      # -------- گزینه‌های جدید ----------
+      push_to_repo:
+        description: 'Push files to repository (instead of only artifact)'
+        required: true
+        type: boolean
+        default: false
+      split_size:
+        description: 'Max size per part (MB) when pushing to repo (default 45)'
+        required: false
+        default: '45'
+        type: string
+      # ----------------------------------
 
 jobs:
   download:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
     steps:
-      # Step 1: Get OAuth2 token from Reddit (if credentials exist)
+      # Step 0: Checkout only if push_to_repo is true (otherwise we don't need repo)
+      - name: 🧰 Checkout repository (for push)
+        if: ${{ github.event.inputs.push_to_repo == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🔧 Configure Git for large files (if pushing)
+        if: ${{ github.event.inputs.push_to_repo == 'true' }}
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          echo "Git configured for large file handling"
+
+      # Step 1: Get OAuth2 token from Reddit (unchanged)
       - name: 🔑 Get Reddit Access Token
         id: auth
         env:
@@ -76,7 +113,7 @@ jobs:
             echo "ACCESS_TOKEN=" >> $GITHUB_ENV
           fi
 
-      # Step 2: Fetch list of posts from Reddit API
+      # Step 2: Fetch Posts (unchanged)
       - name: 📥 Fetch Posts
         id: fetch
         run: |
@@ -96,26 +133,18 @@ jobs:
             curl -sS -H "User-Agent: $UA" "$API_URL" -o raw.json
           fi
 
-          # Process and filter
           jq '[.data.children[].data]' raw.json > all_posts.json
-
-          # Remove sticky and ad posts
           jq '[.[] | select(.stickied == false and .is_ad == false)]' all_posts.json > filtered.json
-
-          # Keep only posts with at least one media element
           jq '[.[] | select(
             (.is_gallery == true and .media_metadata != null) or
             (.post_hint == "image") or
             (.post_hint == "hosted:video") or
             (.url | test("\\.(jpg|jpeg|png|gif|mp4|webm|mov)(\\?.*)?$"; "i"))
           )]' filtered.json > media_posts.json
-
-          # Apply skip and limit
           jq ".[$SKIP:$((SKIP+LIMIT))]" media_posts.json > posts.json
-
           echo "📄 Final post count: $(jq length posts.json)"
 
-      # Step 3: Extract text and link (if requested)
+      # Step 3: Save Text and Links (unchanged)
       - name: 📝 Save Text and Links
         if: ${{ github.event.inputs.include_text == true || github.event.inputs.include_link == true }}
         run: |
@@ -125,25 +154,20 @@ jobs:
             (if "'${{ github.event.inputs.include_link }}'" == "true" then "Link: https://www.reddit.com\(.permalink)\n" else "" end) +
             "---"' posts.json > posts_summary.txt
 
-      # Step 4: Install media tools (ffmpeg, imagemagick, zip)
+      # Step 4: Install tools (add imagemagick if needed for resize)
       - name: 🛠️ Install Multimedia Tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg imagemagick zip
 
-      # Step 5: Extract all media URLs and download files
+      # Step 5: Extract and Download (unchanged)
       - name: 🖼️ Extract and Download Media Files
         run: |
           mkdir -p downloads
-          # Extract URLs of all media (gallery images, reddit videos, direct images, direct links)
           jq -r '.[] |
             [
-              # Galleries
               (select(.is_gallery) | .media_metadata | to_entries[].value |
                 (if .p then (.p[-1].u) else (.s.u) end) ),
-              # Reddit videos
               (select(.media.reddit_video) | .media.reddit_video.fallback_url),
-              # Direct images
               (select(.post_hint == "image") | .url),
-              # Other direct links
               (select(.url | test("\\.(jpg|jpeg|png|gif|mp4|webm|mov)(\\?.*)?$"; "i")) | .url)
             ] | .[]' posts.json | while read url; do
             if [ -n "$url" ]; then
@@ -151,13 +175,12 @@ jobs:
               wget --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
                    --tries=3 --waitretry=5 --random-wait \
                    -q -P downloads "$url" || echo "⚠️ Download failed: $url"
-              # Random delay between 1 and 4 seconds
               sleep $(( RANDOM % 4 + 1 ))
             fi
           done
           echo "✅ Download finished. Files: $(ls downloads | wc -l)"
 
-      # Step 6: Optionally reduce resolution
+      # Step 6: Resize (unchanged)
       - name: 🔄 Resize Media (Optional)
         if: ${{ github.event.inputs.max_height != '0' && github.event.inputs.max_height != '' }}
         run: |
@@ -188,13 +211,12 @@ jobs:
           done
           echo "✅ Resizing complete."
 
-      # Step 7: Package outputs into a ZIP archive (with optional encryption and compression level)
+      # Step 7: Create initial ZIP (no split yet)
       - name: 📦 Create ZIP Archive
-        if: success()
+        id: zip
         run: |
           ZIP_NAME="reddit_media_${{ github.run_id }}.zip"
           ZIP_LEVEL="${{ github.event.inputs.zip_compression }}"
-          # Validate compression level (0-9), fallback to 6 if out of range
           if ! [[ "$ZIP_LEVEL" =~ ^[0-9]$ ]]; then
             echo "⚠️ Invalid compression level '$ZIP_LEVEL', using default (6)"
             ZIP_LEVEL=6
@@ -208,9 +230,115 @@ jobs:
             zip -q -r -"$ZIP_LEVEL" "$ZIP_NAME" downloads posts.json posts_summary.txt
           fi
           echo "ZIP_FILE=$ZIP_NAME" >> $GITHUB_ENV
+          echo "ZIP_PATH=$(pwd)/$ZIP_NAME" >> $GITHUB_ENV
           echo "✅ ZIP archive created: $ZIP_NAME"
 
-      # Step 8: Upload everything as an artifact
+      # -------- بخش جدید: Split و Push به ریپازیتوری ----------
+      - name: 📤 Split & Push to Repository (if enabled)
+        if: ${{ github.event.inputs.push_to_repo == 'true' && success() }}
+        run: |
+          echo "🚀 Preparing to push to repository..."
+          SPLIT_MB=${{ github.event.inputs.split_size }}
+          if ! [[ "$SPLIT_MB" =~ ^[0-9]+$ ]] || [ "$SPLIT_MB" -le 0 ]; then
+            SPLIT_MB=45
+          fi
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          # تابع تولید نام عددی تصادفی (مشابه دانلودر قبلی)
+          generate_random_numeric_name() {
+            local PART1=$(( RANDOM * 32768 + RANDOM ))
+            local PART2=$(( RANDOM * 32768 + RANDOM ))
+            echo "${PART1}${PART2}"
+          }
+
+          get_unique_numeric_folder() {
+            local CANDIDATE
+            while true; do
+              CANDIDATE=$(generate_random_numeric_name)
+              if [ ! -d "downloads_reddit/$CANDIDATE" ]; then
+                echo "$CANDIDATE"
+                return
+              fi
+            done
+          }
+
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          # پوشه مقصد
+          mkdir -p downloads_reddit
+          ZIP_PATH="${{ env.ZIP_PATH }}"
+          ZIP_NAME="${{ env.ZIP_FILE }}"
+          ZIP_SIZE=$(stat -c%s "$ZIP_PATH")
+
+          # ساخت پوشه با نام عددی
+          FOLDER_NAME=$(get_unique_numeric_folder)
+          DEST_DIR="downloads_reddit/$FOLDER_NAME"
+          mkdir -p "$DEST_DIR"
+
+          if [ "$ZIP_SIZE" -gt "$SPLIT_BYTES" ]; then
+            echo "⚡ ZIP size ($(echo "scale=2; $ZIP_SIZE/1024/1024" | bc) MB) exceeds ${SPLIT_MB}MB - splitting"
+            cd "$(dirname "$ZIP_PATH")"
+            # split zip with zero compression (store)
+            zip -0 -s "${SPLIT_MB}m" "${FOLDER_NAME}.zip" "$ZIP_NAME"
+            # move all parts (including original zip, but it's removed by split)
+            for part in ${FOLDER_NAME}.z[0-9]* ${FOLDER_NAME}.zip; do
+              if [ -f "$part" ]; then
+                mv "$part" "$OLDPWD/$DEST_DIR/"
+              fi
+            done
+            cd "$OLDPWD"
+          else
+            echo "📁 Size OK, moving full ZIP"
+            cp "$ZIP_PATH" "$DEST_DIR/${FOLDER_NAME}.zip"
+          fi
+
+          # ساخت README در پوشه
+          PARTS_COUNT=$(ls "$DEST_DIR" | wc -l)
+          FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+          REPO_BASE="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads_reddit/${FOLDER_ENCODED}"
+
+          {
+            echo "# Reddit Media: $FOLDER_NAME"
+            echo "**Original ZIP:** $ZIP_NAME"
+            echo "**Files:** $PARTS_COUNT part(s)"
+            echo "**Password protected:** ${{ github.event.inputs.zip_password != '' }}"
+            echo ""
+            echo "## Download Links"
+            for f in "$DEST_DIR"/*; do
+              partname=$(basename "$f")
+              echo "- [${partname}](${REPO_BASE}/$(urlencode "$partname"))"
+            done
+            echo ""
+            echo "> To extract, download all parts and open the .zip file."
+          } > "$DEST_DIR/README.md"
+
+          # Push (incremental like previous workflow)
+          echo "🔃 Pushing to repository..."
+
+          # اینجا یک push ساده برای تعداد کم فایل انجام می‌دهیم
+          # چون قبلاً ریپو checkout شده است
+          git add downloads_reddit/
+          git diff --cached --quiet || git commit -m "[Reddit] Add $FOLDER_NAME [skip ci]"
+          # try push with retry
+          for i in 1 2 3; do
+            if git pull --rebase origin "$BRANCH" && git push origin HEAD:"$BRANCH"; then
+              echo "✅ Push successful"
+              break
+            else
+              echo "⚠️ Push attempt $i failed, retrying..."
+              sleep 10
+            fi
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 8: Upload Artifact (always done, even if push also happens)
       - name: 📤 Upload Artifact
         uses: actions/upload-artifact@v4
         with:

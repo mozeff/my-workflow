@@ -1,135 +1,128 @@
-name: 📸 09-Multi-URL Browser
+name: ⬇️ 09-Download from URL
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'Space-separated list of URLs (e.g. https://example.com/page1 https://example.com/page2)'
+        description: 'Space-separated list of URLs to download'
         required: true
         type: string
-      zip_password:
-        description: 'Password for the encrypted ZIP (leave blank to skip encryption)'
+      pack_method:
+        description: 'Packaging method'
+        required: true
+        type: choice
+        default: 'zip'
+        options:
+          - none
+          - zip
+          - split
+      password:
+        description: 'Password for zip files (optional)'
         required: false
-        type: string
         default: ''
-      wait_seconds:
-        description: 'How many seconds to wait after scrolling to ensure full page load (default: 3)'
-        required: false
         type: string
-        default: '3'
-      randomize_delay:
-        description: 'Add random extra delay (0-1s) to the wait time to avoid bot detection'
+      compress_images:
+        description: 'Compress downloaded images?'
         required: false
         type: boolean
-        default: true
+        default: false
+      image_quality:
+        description: 'Image quality (if compression enabled)'
+        required: false
+        type: choice
+        default: 'medium'
+        options:
+          - low
+          - medium
+          - high
+      split_size:
+        description: 'Max size per part (MB) - for split mode (default 45)'
+        required: false
+        default: '45'
+        type: string
+      take_screenshot:
+        description: 'Take a full-page screenshot of each URL?'
+        required: false
+        type: boolean
+        default: false
+      download_images:
+        description: 'Download all images found in the page?'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
-  browse:
+  save-file:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      - name: Install system dependencies
+      - name: Configure Git for Large Files
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          echo "Git configured for large file handling"
+
+      - name: Install required packages
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl zip
-
-      - name: Setup Node.js and Puppeteer
-        run: |
-          npm init -y > /dev/null
-          npm install puppeteer > /dev/null
-
-      # ------------------------------------------------------------
-      # اسکریپت Puppeteer (با پشتیبانی از تأخیر تصادفی)
-      # ------------------------------------------------------------
-      - name: Create screenshot & HTML extractor script
-        run: |
-          cat > screenshot.js << 'EOF'
-          const puppeteer = require('puppeteer');
-          const fs = require('fs');
-          const url = process.argv[2];
-          const screenshotPath = process.argv[3];
-          const htmlPath = process.argv[4];
-          const waitSecondsBase = parseFloat(process.argv[5]) || 3;
-
-          // خواندن گزینه تصادفی‌سازی از متغیر محیطی
-          const randomize = (process.env.RANDOMIZE_DELAY || 'false') === 'true';
-
-          (async () => {
-            const browser = await puppeteer.launch({
-              headless: true,
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-            });
-            const page = await browser.newPage();
-            await page.setViewport({ width: 1280, height: 720 });
-
-            try {
-              await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-
-              // اسکرول برای فعال‌سازی lazy loading
-              await page.evaluate(async () => {
-                await new Promise((resolve) => {
-                  let totalHeight = 0;
-                  const distance = 300;
-                  const timer = setInterval(() => {
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-                    if (totalHeight >= document.body.scrollHeight) {
-                      clearInterval(timer);
-                      resolve();
-                    }
-                  }, 150);
-                });
-              });
-
-              // تعیین زمان انتظار نهایی
-              let waitSeconds = waitSecondsBase;
-              if (randomize) {
-                // اضافه کردن ۰ تا ۱ ثانیه تصادفی
-                waitSeconds = waitSecondsBase + Math.random();
-                console.log(`Randomizing delay: base=${waitSecondsBase}, actual=${waitSeconds.toFixed(2)}`);
-              } else {
-                console.log(`Waiting ${waitSeconds} seconds...`);
-              }
-
-              await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
-
-              await page.screenshot({ path: screenshotPath, fullPage: true });
-              console.log('Screenshot saved successfully');
-
-              const html = await page.content();
-              fs.writeFileSync(htmlPath, html);
-              console.log('Rendered HTML saved successfully');
-            } catch (err) {
-              console.error('Error:', err.message);
-              process.exitCode = 1;
-            } finally {
-              await browser.close();
-            }
-          })();
-          EOF
-
-      # ------------------------------------------------------------
-      # توابع تولید نام تصادفی عددی + ایجاد README با تصاویر به‌ترتیب
-      # ------------------------------------------------------------
-      - name: Process each URL and collect all data
-        shell: bash
-        env:
-          RANDOMIZE_DELAY: ${{ github.event.inputs.randomize_delay }}
-        run: |
-          set -euo pipefail
-
-          IFS=' ' read -ra URLS_ARRAY <<< "${{ github.event.inputs.urls }}"
-
-          if [ ${#URLS_ARRAY[@]} -eq 0 ]; then
-            echo "No URLs provided"
-            exit 1
+          sudo apt-get install -y -qq aria2 zip curl bc imagemagick
+          # اگر حداقل یکی از گزینه‌های اسکرین‌شات یا تصاویر فعال باشد Node.js و puppeteer نصب شود
+          if [ "${{ github.event.inputs.take_screenshot }}" = "true" ] || [ "${{ github.event.inputs.download_images }}" = "true" ]; then
+            echo "Installing Node.js for scraping..."
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y -qq nodejs
+            npm install puppeteer
           fi
 
+      - name: Download, compress images, and package files
+        run: |
+          MODE="${{ github.event.inputs.pack_method }}"
+          URLS="${{ github.event.inputs.urls }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+          COMPRESS_IMAGES="${{ github.event.inputs.compress_images }}"
+          IMAGE_QUALITY="${{ github.event.inputs.image_quality }}"
+          SPLIT_THRESHOLD_MB=${{ github.event.inputs.split_size }}
+          TAKE_SCREENSHOT="${{ github.event.inputs.take_screenshot }}"
+          DOWNLOAD_IMAGES="${{ github.event.inputs.download_images }}"
+
+          if ! [[ "$SPLIT_THRESHOLD_MB" =~ ^[0-9]+$ ]] || [ "$SPLIT_THRESHOLD_MB" -le 0 ]; then
+            echo "Invalid part size, using default 45"
+            SPLIT_THRESHOLD_MB=45
+          fi
+          SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
+
+          case "$IMAGE_QUALITY" in
+            low)    QUALITY=30 ;;
+            medium) QUALITY=60 ;;
+            high)   QUALITY=85 ;;
+            *)      QUALITY=60 ;;
+          esac
+
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          BACKUP_DIR="/tmp/download_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+
+          mkdir -p tmp_downloads
+
+          # --- توابع کمکی ---
           generate_random_numeric_name() {
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
@@ -140,216 +133,297 @@ jobs:
             local CANDIDATE
             while true; do
               CANDIDATE=$(generate_random_numeric_name)
-              if [ ! -d "pages/$CANDIDATE" ] && [ ! -f "pages/$CANDIDATE.zip" ] && [ ! -d "/tmp/${CANDIDATE}" ]; then
+              if [ ! -d "$BACKUP_DIR/$CANDIDATE" ] && [ ! -d "downloads/$CANDIDATE" ]; then
                 echo "$CANDIDATE"
                 return
               fi
             done
           }
 
-          BATCH_FOLDER=$(get_unique_numeric_folder)
-          BATCH_PATH="pages/$BATCH_FOLDER"
-          mkdir -p "$BATCH_PATH"
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
 
-          echo "Batch session ID: $BATCH_FOLDER"
+          download_with_retry() {
+            local URL="$1"
+            local FILENAME="$2"
+            local MAX_RETRIES=3
+            local SUCCESS=false
+            local ERROR_LOG=""
 
-          TOTAL_URLS=${#URLS_ARRAY[@]}
-          TOTAL_MEDIA=0
-          GLOBAL_IMG_COUNTER=0
+            rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
 
-          cat > "$BATCH_PATH/README.md" << 'README_HEADER'
-          # 📸 Downloaded Images (in order)
-          README_HEADER
-          echo "" >> "$BATCH_PATH/README.md"
+            for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
+              echo "Attempt $attempt of $MAX_RETRIES for $FILENAME"
+              ERROR_LOG=$(aria2c \
+                --split=2 \
+                --max-connection-per-server=2 \
+                --min-split-size=20M \
+                --max-tries=3 \
+                --retry-wait=5 \
+                --timeout=60 \
+                --connect-timeout=30 \
+                --follow-torrent=false \
+                --check-certificate=false \
+                --allow-overwrite=true \
+                --auto-file-renaming=false \
+                --dir="tmp_downloads" \
+                --out="$FILENAME" \
+                "$URL" 2>&1)
 
-          cat > "$BATCH_PATH/index.md" << INDEX_HEADER
-          # Batch Session: $BATCH_FOLDER
-          **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          **Number of URLs processed:** $TOTAL_URLS
-
-          ## Processed Sessions
-          INDEX_HEADER
-
-          for (( idx=0; idx<${TOTAL_URLS}; idx++ )); do
-            RAW_URL="${URLS_ARRAY[$idx]}"
-
-            if [[ ! "$RAW_URL" =~ ^https?:// ]]; then
-              HTTPS_URL="https://$RAW_URL"
-              if curl -fsL --connect-timeout 10 --max-time 30 -o /dev/null "$HTTPS_URL" 2>/dev/null; then
-                URL="$HTTPS_URL"
-              else
-                URL="http://$RAW_URL"
+              if [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
+                SUCCESS=true
+                break
               fi
+
+              rm -f "tmp_downloads/$FILENAME"
+              ERROR_LOG=$(curl -L -f -# \
+                --retry 3 \
+                --retry-delay 5 \
+                --connect-timeout 30 \
+                --max-time 3600 \
+                -A "Mozilla/5.0" \
+                -o "tmp_downloads/$FILENAME" \
+                "$URL" 2>&1)
+              if [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
+                SUCCESS=true
+                break
+              fi
+              sleep 5
+            done
+
+            if [ "$SUCCESS" = true ]; then
+              return 0
             else
-              URL="$RAW_URL"
+              echo "Download failed: $FILENAME"
+              rm -f "tmp_downloads/$FILENAME"
+              return 1
             fi
+          }
 
-            URL_FOLDER=$(get_unique_numeric_folder)
-            FOLDER="$BATCH_PATH/$URL_FOLDER"
-            MEDIA_DIR="$FOLDER/media"
-            mkdir -p "$FOLDER" "$MEDIA_DIR"
-
-            echo "🔄 [$((idx+1))/$TOTAL_URLS] Processing session ID: $URL_FOLDER"
-
-            SCREENSHOT_OK=false
-            if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html" "${{ github.event.inputs.wait_seconds }}"; then
-              SCREENSHOT_OK=true
-              echo "  ✅ Puppeteer succeeded"
+          compress_image() {
+            local IMG="$1"
+            local ORIG_SIZE=$(stat -c%s "$IMG")
+            echo "Compressing $IMG (quality $QUALITY%)"
+            convert "$IMG" -quality "$QUALITY" "$IMG.compressed"
+            local NEW_SIZE=$(stat -c%s "$IMG.compressed")
+            if [ "$NEW_SIZE" -lt "$ORIG_SIZE" ] && [ "$NEW_SIZE" -gt 0 ]; then
+              mv "$IMG.compressed" "$IMG"
+              echo "  Reduced: $ORIG_SIZE -> $NEW_SIZE bytes"
             else
-              echo "  ⚠️ Puppeteer failed, falling back to curl for raw HTML"
-              curl -sSL -A "Mozilla/5.0" -o "$FOLDER/page.html" "$URL" || {
-                echo "  ❌ Could not download HTML, creating placeholder"
-                echo "<html><body>Failed to load URL</body></html>" > "$FOLDER/page.html"
+              echo "  No reduction, kept original"
+              rm -f "$IMG.compressed"
+            fi
+          }
+          
+          if [ "$TAKE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_IMAGES" = "true" ]; then
+            cat > scrape.js << 'EOF'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+          const url = process.argv[2];
+          const idx = process.argv[3];
+          const doScreenshot = process.argv[4] === 'true';
+          const doImages = process.argv[5] === 'true';
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 720 });
+
+            try {
+              await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+              if (doScreenshot) {
+                const shotPath = `tmp_downloads/screenshot_${idx}.png`;
+                await page.screenshot({ path: shotPath, fullPage: true });
+                console.log(`Screenshot saved: ${shotPath}`);
               }
+
+              if (doImages) {
+                const imgUrls = await page.evaluate(() =>
+                  Array.from(document.querySelectorAll('img'))
+                    .map(img => img.src)
+                    .filter(src => src.match(/\.(png|jpg|jpeg|gif|svg|webp)(\?.*)?$/i))
+                );
+                for (const imgUrl of imgUrls) {
+                  const name = imgUrl.split('/').pop().split('?')[0].replace(/[^a-zA-Z0-9._-]/g, '_');
+                  const dest = `tmp_downloads/img_${idx}_${name}`;
+                  try {
+                    const response = await page.goto(imgUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+                    if (response && response.ok) {
+                      const buffer = await response.buffer();
+                      fs.writeFileSync(dest, buffer);
+                      console.log(`Image downloaded: ${dest}`);
+                    }
+                  } catch (e) {
+                    console.log(`Failed to download image: ${imgUrl}`);
+                  }
+                }
+              }
+            } catch (err) {
+              console.error(`Scrape error for ${url}: ${err.message}`);
+            } finally {
+              await browser.close();
+            }
+          })();
+          EOF
+          fi
+
+          # --- پردازش هر URL ---
+          idx=0
+          for URL in $URLS; do
+            idx=$((idx + 1))
+
+            # ۱. اجرای اسکریپت scrape در صورت نیاز
+            if [ "$TAKE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_IMAGES" = "true" ]; then
+              echo "🌐 Scraping page #$idx: $URL"
+              node scrape.js "$URL" "$idx" "$TAKE_SCREENSHOT" "$DOWNLOAD_IMAGES" || echo "⚠️ Scrape failed for $URL"
             fi
 
-            grep -ohP '(?:href|src)="\K[^"]*' "$FOLDER/page.html" | sort -u > "$FOLDER/all_links.txt"
-
-            MEDIA_EXT='png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|zip|rar|tar|gz|7z'
-            IMG_EXT='png|jpg|jpeg|gif|svg|webp'
-
-            > "$FOLDER/media_links.txt"
-            > "$FOLDER/other_links.txt"
-            > "$FOLDER/downloaded_media.md"
-            echo "## Downloaded Media Files" > "$FOLDER/downloaded_media.md"
-            echo "" >> "$FOLDER/downloaded_media.md"
-
-            BASE_PROTOCOL_DOMAIN="$(echo "$URL" | awk -F/ '{print $1"//"$3}')"
-
-            while IFS= read -r link; do
-              [[ -z "$link" || "$link" =~ ^# ]] && continue
-              if [[ "$link" =~ ^https?:// ]]; then
-                ABS_URL="$link"
-              elif [[ "$link" = /* ]]; then
-                ABS_URL="${BASE_PROTOCOL_DOMAIN}${link}"
-              else
-                ABS_URL="${BASE_PROTOCOL_DOMAIN}/${link}"
-              fi
-
-              ext="${link##*.}"
-              ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
-
-              if echo "$ext_lower" | grep -Eq "^($MEDIA_EXT)$"; then
-                SAFE_NAME=$(basename "$link" | sed 's/[?#].*//; s/[^a-zA-Z0-9._-]/_/g')
-                [[ ! -f "$MEDIA_DIR/$SAFE_NAME" ]] || SAFE_NAME="dup_$(date +%s)_${SAFE_NAME}"
-
-                if curl -sSL --retry 2 --max-time 60 -o "$MEDIA_DIR/$SAFE_NAME" "$ABS_URL"; then
-                  SIZE=$(stat -c%s "$MEDIA_DIR/$SAFE_NAME" 2>/dev/null || echo 0)
-                  if [[ "$SIZE" -gt 0 ]]; then
-                    echo "$link" >> "$FOLDER/media_links.txt"
-                    if [[ "$ext_lower" =~ ^($IMG_EXT)$ ]]; then
-                      GLOBAL_IMG_COUNTER=$((GLOBAL_IMG_COUNTER + 1))
-                      echo "$GLOBAL_IMG_COUNTER. ![$SAFE_NAME](./$URL_FOLDER/media/$SAFE_NAME)" >> "$BATCH_PATH/README.md"
-                      echo "![$SAFE_NAME](./media/$SAFE_NAME)" >> "$FOLDER/downloaded_media.md"
-                    else
-                      echo "- [$SAFE_NAME](./media/$SAFE_NAME) (${SIZE} bytes)" >> "$FOLDER/downloaded_media.md"
-                    fi
-                  fi
-                fi
-              else
-                echo "$link" >> "$FOLDER/other_links.txt"
-              fi
-            done < "$FOLDER/all_links.txt"
-
-            MEDIA_COUNT=$(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l)
-            {
-              echo "# Session ID: $URL_FOLDER"
-              echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-              echo ""
-              if $SCREENSHOT_OK && [[ -f "$FOLDER/screenshot.png" ]]; then
-                echo "## Screenshot"
-                echo "![Screenshot](./screenshot.png)"
-                echo ""
-              fi
-              echo "## HTML Source"
-              echo "[page.html](./page.html)  ($(wc -c < "$FOLDER/page.html") bytes)"
-              echo ""
-              echo "## Downloaded Media ($MEDIA_COUNT files)"
-              if [[ "$MEDIA_COUNT" -gt 0 ]]; then
-                cat "$FOLDER/downloaded_media.md"
-              else
-                echo "_No media files downloaded_"
-              fi
-              echo ""
-              echo "## Other Links"
-              if [[ -s "$FOLDER/other_links.txt" ]]; then
-                head -50 "$FOLDER/other_links.txt" | while IFS= read -r entry; do
-                  echo "- [$entry]($entry)"
-                done
-              fi
-              echo ""
-              echo "## Stats"
-              echo "- Links found: $(wc -l < "$FOLDER/all_links.txt")"
-              echo "- Media downloaded: $MEDIA_COUNT"
-            } > "$FOLDER/index.md"
-
-            echo "- **[$URL_FOLDER](./$URL_FOLDER/index.md)** — $MEDIA_COUNT media files" >> "$BATCH_PATH/index.md"
-
-            TOTAL_MEDIA=$((TOTAL_MEDIA + MEDIA_COUNT))
+            # ۲. دانلود مستقیم URL به عنوان فایل (حالت قبلی)
+            FILENAME=$(basename "$URL" | sed 's/%20/ /g' | sed 's/%2F/-/g' | sed 's/[?#].*//')
+            FILENAME=$(echo "$FILENAME" | sed 's/[<>:"|?*]/_/g')
+            echo "📥 Direct download #$idx: $URL -> $FILENAME"
+            download_with_retry "$URL" "$FILENAME" || echo "Failed direct download: $FILENAME"
           done
 
-          echo "" >> "$BATCH_PATH/index.md"
-          echo "## Overall Stats" >> "$BATCH_PATH/index.md"
-          echo "- Total URLs: $TOTAL_URLS" >> "$BATCH_PATH/index.md"
-          echo "- Total media files: $TOTAL_MEDIA" >> "$BATCH_PATH/index.md"
+          # --- فشرده‌سازی تصاویر (روی همه فایل‌های تصویری موجود) ---
+          if [ "$COMPRESS_IMAGES" = "true" ]; then
+            echo "====== Compressing images ======"
+            find tmp_downloads -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" -o -iname "*.bmp" \) -exec bash -c 'compress_image "$0"' {} \;
+          fi
 
-          echo "" >> "$BATCH_PATH/README.md"
-          echo "**Total images:** $GLOBAL_IMG_COUNTER" >> "$BATCH_PATH/README.md"
+          # --- بسته‌بندی و تولید README (بدون تغییر) ---
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+            FOLDER_NAME=$(get_unique_numeric_folder)
+            mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+            FOLDER_ENCODED=$(urlencode "${FOLDER_NAME}")
 
-          echo "BATCH_FOLDER=$BATCH_FOLDER" >> $GITHUB_ENV
-          echo "TOTAL_URLS=$TOTAL_URLS" >> $GITHUB_ENV
-          echo "TOTAL_MEDIA=$TOTAL_MEDIA" >> $GITHUB_ENV
+            if [ "$MODE" = "none" ]; then
+              mv "$FILE" "$BACKUP_DIR/$FOLDER_NAME/$BASENAME"
+              RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "$BASENAME")"
+              {
+                echo "# $BASENAME"
+                echo "Size: $(echo "scale=2; $SIZE/1024/1024" | bc) MB"
+                echo "Status: Complete"
+                echo "Download: [${BASENAME}](${RAW_LINK})"
+              } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+              echo "Stored raw: $BASENAME"
 
-          echo "✅ All URLs processed. README with $GLOBAL_IMG_COUNTER images created."
+            elif [ "$MODE" = "zip" ]; then
+              if [ -n "$ZIP_PASSWORD" ]; then
+                zip -j -P "$ZIP_PASSWORD" "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
+              else
+                zip -j "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
+              fi
+              ZIP_SIZE=$(stat -c%s "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip")
+              ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1024/1024" | bc)
+              RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "${FOLDER_NAME}.zip")"
+              {
+                echo "# $BASENAME (ZIP)"
+                echo "Original size: $(echo "scale=2; $SIZE/1024/1024" | bc) MB"
+                echo "ZIP size: ${ZIP_MB} MB"
+                echo "Status: Complete"
+                echo "Download: [${FOLDER_NAME}.zip](${RAW_LINK})"
+              } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+              echo "Created zip: ${FOLDER_NAME}.zip"
 
-      # ------------------------------------------------------------
-      # ایجاد ZIP (با رمز اختیاری) و حذف پوشه اصلی
-      # ------------------------------------------------------------
-      - name: Create zip archive (with optional encryption) and remove folder
-        if: success()
-        env:
-          ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
-        run: |
-          BATCH_FOLDER="${{ env.BATCH_FOLDER }}"
-          cd pages
-          if [ -d "$BATCH_FOLDER" ]; then
-            if [ -n "$ZIP_PASSWORD" ]; then
-              echo "🔐 Creating encrypted ZIP..."
-              zip -qr -P "$ZIP_PASSWORD" "${BATCH_FOLDER}.zip" "$BATCH_FOLDER"
-            else
-              echo "📦 Creating unencrypted ZIP..."
-              zip -qr "${BATCH_FOLDER}.zip" "$BATCH_FOLDER"
+            elif [ "$MODE" = "split" ]; then
+              if [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
+                echo "$BASENAME is large, splitting into ${SPLIT_THRESHOLD_MB}MB parts"
+                cd tmp_downloads
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$BASENAME"
+                else
+                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" "${FOLDER_NAME}.zip" "$BASENAME"
+                fi
+                for part in ${FOLDER_NAME}.z[0-9]* ${FOLDER_NAME}.zip; do
+                  [ -f "$part" ] && mv "$part" "$BACKUP_DIR/$FOLDER_NAME/"
+                done
+                cd ..
+                {
+                  echo "# $BASENAME (split)"
+                  echo "Parts:"
+                  for part_file in "$BACKUP_DIR/$FOLDER_NAME"/*; do
+                    [ -f "$part_file" ] || continue
+                    part_name=$(basename "$part_file")
+                    part_link="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "$part_name")"
+                    echo "- [${part_name}](${part_link})"
+                  done
+                  echo "Download all parts and extract the first .zip"
+                } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+              else
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  zip -j -P "$ZIP_PASSWORD" "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
+                else
+                  zip -j "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
+                fi
+                ZIP_SIZE=$(stat -c%s "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip")
+                ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1024/1024" | bc)
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "${FOLDER_NAME}.zip")"
+                {
+                  echo "# $BASENAME (ZIP)"
+                  echo "Size: ${ZIP_MB} MB"
+                  echo "Download: [${FOLDER_NAME}.zip](${RAW_LINK})"
+                } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+              fi
+              rm -f "$FILE"
             fi
-            rm -rf "$BATCH_FOLDER"
-          fi
-          cd "$GITHUB_WORKSPACE"
+          done
 
-      # ------------------------------------------------------------
-      # به‌روزرسانی browse.md و commit
-      # ------------------------------------------------------------
-      - name: Commit and push results
-        if: success()
+          rm -rf tmp_downloads
+          echo "Packaging completed."
+
+      - name: Update README.md and push
         run: |
-          BATCH_FOLDER="${{ env.BATCH_FOLDER }}"
-          TOTAL_URLS="${{ env.TOTAL_URLS }}"
-          TOTAL_MEDIA="${{ env.TOTAL_MEDIA }}"
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
 
-          BROWSE_FILE="browse.md"
-          if [[ ! -f "$BROWSE_FILE" ]]; then
-            echo "# Browsed Websites" > "$BROWSE_FILE"
-            echo "" >> "$BROWSE_FILE"
-          fi
-          echo "- [Batch $BATCH_FOLDER](./pages/${BATCH_FOLDER}.zip) — $TOTAL_URLS URLs, $TOTAL_MEDIA media files" >> "$BROWSE_FILE"
-
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add pages/ browse.md
-
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-            exit 0
+          mkdir -p downloads
+          if [ -d "$BACKUP_DIR" ] && [ "$(ls -A $BACKUP_DIR 2>/dev/null)" ]; then
+            cp -r "$BACKUP_DIR"/* downloads/
           fi
 
-          git commit -m "[Multi-Browse] Batch $BATCH_FOLDER [skip ci]"
-          git pull --rebase origin "${{ github.ref_name }}"
-          git push origin HEAD:"${{ github.ref_name }}"
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          {
+            echo "# Downloaded list :"
+            echo ""
+            for folder in downloads/*/; do
+              [ -d "$folder" ] || continue
+              FNAME=$(basename "$folder")
+              FENCODED=$(urlencode "$FNAME")
+              echo "- [${FNAME}](./${FENCODED})"
+            done
+            echo ""
+            echo "---"
+          } > downloads/README.md
+
+          touch README.md
+          sed -i '/^## Latest Downloads/,/^---$/d' README.md
+          {
+            echo "## Latest Downloads"
+            for folder in downloads/*/; do
+              [ -d "$folder" ] || continue
+              FNAME=$(basename "$folder")
+              FENCODED=$(urlencode "$FNAME")
+              echo "- [${FNAME}](${REPO_URL}/${FENCODED})"
+            done
+            echo "---"
+          } >> README.md
+
+          git add downloads/ README.md
+          git diff --cached --quiet || git commit -m "[Download] New files [skip ci]"
+          git pull --rebase origin "$BRANCH"
+          git push origin HEAD:"$BRANCH"
