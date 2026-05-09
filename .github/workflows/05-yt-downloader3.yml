@@ -47,6 +47,12 @@ on:
         required: false
         default: false
         type: boolean
+      # ⭐ ورودی جدید: حداکثر حجم هر پارت (مگابایت) برای split کردن فایل‌های بزرگ
+      split_size:
+        description: 'Max size per part (MB) – file will be split if larger (default 90)'
+        required: false
+        default: '90'
+        type: string
 
 jobs:
   download-youtube:
@@ -97,6 +103,29 @@ jobs:
             echo "Response: $FINAL"
           fi
 
+      - name: Start PO Token Provider
+        run: |
+          echo "Starting PO Token Provider container..."
+          docker run -d \
+            --name bgutil-provider \
+            -p 4416:4416 \
+            brainicism/bgutil-ytdlp-pot-provider:latest
+          echo "Waiting for provider to be ready..."
+          for i in {1..10}; do
+            if curl -s http://127.0.0.1:4416/pot >/dev/null 2>&1; then
+              echo "PO Token Provider is ready!"
+              break
+            else
+              echo "Attempt $i/10 - provider not ready, waiting 5s..."
+              sleep 5
+            fi
+          done
+          if curl -s http://127.0.0.1:4416/pot >/dev/null; then
+            echo "Provider confirmed working."
+          else
+            echo "::warning::PO Token Provider might not be ready. Downloads may fail."
+          fi
+
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
@@ -108,9 +137,6 @@ jobs:
           deno --version
           pip3 install --upgrade yt-dlp
 
-      # ─────────────────────────────────────────────────────────
-      # مرحله ۱: پیش‌بررسی کیفیت‌های موجود (با fallback client)
-      # ─────────────────────────────────────────────────────────
       - name: Pre-check available video qualities
         id: quality_check
         run: |
@@ -131,22 +157,18 @@ jobs:
           fi
 
           PROXY="--proxy socks5://127.0.0.1:1080"
-          # چند client مختلف برای شناسایی ارتفاع‌های موجود
+          POT_ARG="--extractor-args youtube:pot-provider=http://127.0.0.1:4416"
           CLIENTS=(
-            # iOS (User-Agent iPhone)
-            "--extractor-args youtube:player_client=ios --user-agent 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'"
-            # Android (User-Agent SM-S906N)
-            "--extractor-args youtube:player_client=android --user-agent 'Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36'"
-            # Web (با deno و User-Agent دسکتاپ)
             "--extractor-args youtube:player_client=web --js-runtimes deno --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' --add-header Accept-Language:en-US,en;q=0.9"
-            # Mweb (موبایل وب)
             "--extractor-args youtube:player_client=mweb"
+            "--extractor-args youtube:player_client=android --user-agent 'Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36'"
+            "--extractor-args youtube:player_client=ios --user-agent 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'"
           )
 
           FORMAT_LIST=""
           for client_args in "${CLIENTS[@]}"; do
             echo "🔍 Trying with client: ${client_args%% *}..."
-            TEMP_OUT=$(yt-dlp ${PROXY} ${client_args} ${COOKIES_FILE} \
+            TEMP_OUT=$(yt-dlp ${PROXY} ${POT_ARG} ${client_args} ${COOKIES_FILE} \
               --no-playlist --no-check-certificates \
               --print "%(height)s" "$URL" 2>/tmp/yt_probe_err.log || true)
             if [ -n "$TEMP_OUT" ]; then
@@ -180,10 +202,8 @@ jobs:
             fi
           fi
 
-      # ─────────────────────────────────────────────────────────
-      # مرحله ۲: دانلود (با متد‌های مختلف و بدون خروج زودهنگام)
-      # ─────────────────────────────────────────────────────────
       - name: Download YouTube video/audio
+        id: download
         run: |
           set -uo pipefail
 
@@ -196,8 +216,13 @@ jobs:
           YOUTUBE_COOKIES_SECRET="${{ secrets.YOUTUBE_COOKIES }}"
           STRICT="${{ github.event.inputs.strict_quality }}"
           USE_EXACT="${{ steps.quality_check.outputs.use_exact }}"
-          SPLIT_MB=90
-          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+          # ⭐ خواندن حجم پارت از ورودی جدید
+          SPLIT_SIZE_INPUT="${{ github.event.inputs.split_size }}"
+          if ! [[ "$SPLIT_SIZE_INPUT" =~ ^[0-9]+$ ]] || [ "$SPLIT_SIZE_INPUT" -le 0 ]; then
+            echo "Invalid split size, using default 90"
+            SPLIT_SIZE_INPUT=90
+          fi
+          SPLIT_BYTES=$(( SPLIT_SIZE_INPUT * 1024 * 1024 ))
 
           [ "$COMPRESSION" -lt 0 ] && COMPRESSION=0
           [ "$COMPRESSION" -gt 9 ] && COMPRESSION=9
@@ -221,7 +246,7 @@ jobs:
             [ "$USE_COOKIES" = "true" ] && echo "WARNING: use_cookies is ON but secret is empty."
           fi
 
-          echo "Downloading: $URL (Audio=$AUDIO_ONLY, Quality=$QUALITY, Cookies=$COOKIES_STATUS, Strict=$STRICT)"
+          echo "Downloading: $URL (Audio=$AUDIO_ONLY, Quality=$QUALITY, Cookies=$COOKIES_STATUS, Strict=$STRICT, Split size=${SPLIT_SIZE_INPUT}MB)"
 
           sanitize_name() { echo "$1" | sed 's/ /-/g; s/　/-/g' | tr -s '-'; }
           urlencode() { python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
@@ -232,7 +257,7 @@ jobs:
             DOWNLOAD_TYPE="video"
           fi
 
-          # انتخاب فرمت
+          # Build FORMAT string (unchanged)
           if [ "$AUDIO_ONLY" = "true" ]; then
             FORMAT="bestaudio/best"
           else
@@ -270,70 +295,30 @@ jobs:
 
           COMMON_FLAGS=(--output "tmp_downloads/%(title)s.%(ext)s" --no-part --no-playlist --retries 10 --fragment-retries 10 --no-check-certificates)
 
-          # تابع برای ساخت آرایه آرگومان‌های هر متد
           get_method_args() {
             local meth="$1"
             args=()
+            local POT_ARG="--extractor-args"
+            local POT_VALUE="youtube:pot-provider=http://127.0.0.1:4416"
             case "$meth" in
-              1)
-                args+=("--proxy" "socks5://127.0.0.1:1080")
-                args+=("--extractor-args" "youtube:player_client=ios")
-                args+=("--user-agent" "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1")
-                args+=("--concurrent-fragments" "4")
-                ;;
-              2)
-                args+=("--proxy" "socks5://127.0.0.1:1080")
-                args+=("--extractor-args" "youtube:player_client=web")
-                args+=("--js-runtimes" "deno")
-                args+=("--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                args+=("--add-header" "Accept-Language:en-US,en;q=0.9")
-                ;;
-              3)
-                args+=("--proxy" "socks5://127.0.0.1:1080")
-                args+=("--extractor-args" "youtube:player_client=mweb")
-                args+=("--concurrent-fragments" "4")
-                ;;
-              4)
-                args+=("--proxy" "socks5://127.0.0.1:1080")
-                args+=("--extractor-args" "youtube:player_client=android")
-                args+=("--user-agent" "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36")
-                args+=("--concurrent-fragments" "4")
-                ;;
-              5)
-                args+=("--proxy" "socks5://127.0.0.1:1080")
-                args+=("--extractor-args" "youtube:player_client=mweb,android,ios")
-                args+=("--concurrent-fragments" "4")
-                ;;
-              6)
-                args+=("--extractor-args" "youtube:player_client=ios")
-                args+=("--concurrent-fragments" "4")
-                ;;
-              7)
-                args+=("--extractor-args" "youtube:player_client=web")
-                args+=("--js-runtimes" "deno")
-                args+=("--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                args+=("--add-header" "Accept-Language:en-US,en;q=0.9")
-                ;;
-              8)
-                args+=("--extractor-args" "youtube:player_client=mweb")
-                args+=("--concurrent-fragments" "4")
-                ;;
-              9)
-                args+=("--extractor-args" "youtube:player_client=android")
-                args+=("--concurrent-fragments" "4")
-                ;;
-              10)
-                args+=("--proxy" "socks5://127.0.0.1:1080")
-                args+=("--extractor-args" "youtube:player_client=mweb,android,ios,android_vr")
-                args+=("--concurrent-fragments" "4")
-                ;;
-              *)
-                echo "Unknown method $meth"; exit 1 ;;
+              1)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9") ;;
+              2)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=mweb" "--concurrent-fragments" "4") ;;
+              3)  args+=("--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9") ;;
+              4)  args+=("--extractor-args" "youtube:player_client=mweb" "--concurrent-fragments" "4") ;;
+              5)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=web,mweb" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9" "--concurrent-fragments" "4") ;;
+              6)  args+=("--extractor-args" "youtube:player_client=android" "--user-agent" "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" "--concurrent-fragments" "4") ;;
+              7)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=android" "--user-agent" "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" "--concurrent-fragments" "4") ;;
+              8)  args+=("--extractor-args" "youtube:player_client=web,mweb" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9" "--concurrent-fragments" "4") ;;
+              9)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=ios" "--user-agent" "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1" "--concurrent-fragments" "4") ;;
+              10) args+=("--extractor-args" "youtube:player_client=ios" "--concurrent-fragments" "4") ;;
+              *)   echo "Unknown method $meth"; exit 1 ;;
             esac
+            args+=("$POT_ARG" "$POT_VALUE")
           }
 
           DOWNLOAD_SUCCESS=false
           TOTAL_METHODS=10
+          BEST_HEIGHT=0
 
           for (( meth=1; meth<=TOTAL_METHODS; meth++ )); do
             echo "Trying method $meth/$TOTAL_METHODS..."
@@ -342,10 +327,29 @@ jobs:
             yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} "${args[@]}" "$URL" 2>&1 | tee -a "$YT_LOG"
             YT_EXIT=${PIPESTATUS[0]}
             set -e
+
             if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
               DOWNLOAD_SUCCESS=true
               echo "Success with method $meth (exit=$YT_EXIT)"
-              break
+              if [ "$AUDIO_ONLY" != "true" ] && [ "$QUALITY" != "best" ]; then
+                VIDEO_FILE=$(find tmp_downloads -type f ! -name "*.part" -size +0 2>/dev/null | head -1)
+                if [ -n "$VIDEO_FILE" ]; then
+                  HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VIDEO_FILE" 2>/dev/null | head -1)
+                  if [ -n "$HEIGHT" ] && [ "$HEIGHT" -ge 0 ] 2>/dev/null; then
+                    BEST_HEIGHT=$HEIGHT
+                    if [ "$HEIGHT" -ge "$QUALITY" ]; then
+                      echo "✅ Achieved ${HEIGHT}p (desired ${QUALITY}p). Stopping."
+                      break
+                    else
+                      echo "⚠️ Got ${HEIGHT}p, need ${QUALITY}p. Trying next method..."
+                      rm -rf tmp_downloads/*
+                      DOWNLOAD_SUCCESS=false
+                    fi
+                  fi
+                fi
+              else
+                break
+              fi
             else
               echo "Method $meth failed, waiting..."
               sleep $((RANDOM % 10 + 5))
@@ -353,16 +357,26 @@ jobs:
             fi
           done
 
-          # اگر هیچکدام موفق نبود، متد با کوکی امتحان شود
-          if ! $DOWNLOAD_SUCCESS && [ "$COOKIES_STATUS" = "YES" ]; then
-            echo "Trying final cookies method..."
-            set +e
-            yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} --extractor-args "youtube:player_client=web" "$URL" 2>&1 | tee -a "$YT_LOG"
-            YT_EXIT=${PIPESTATUS[0]}
-            set -e
-            if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
+          if ! $DOWNLOAD_SUCCESS; then
+            if [ -z "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
+              echo "No file yet, trying final fallback with web,mweb..."
+              set +e
+              yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} \
+                --extractor-args "youtube:player_client=web,mweb;pot-provider=http://127.0.0.1:4416" \
+                --js-runtimes deno \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+                --add-header "Accept-Language:en-US,en;q=0.9" \
+                --concurrent-fragments 4 \
+                "$URL" 2>&1 | tee -a "$YT_LOG"
+              YT_EXIT=${PIPESTATUS[0]}
+              set -e
+              if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
+                DOWNLOAD_SUCCESS=true
+                echo "Fallback succeeded."
+              fi
+            else
               DOWNLOAD_SUCCESS=true
-              echo "Success with cookies method"
+              echo "Accepting previously downloaded lower quality file."
             fi
           fi
 
@@ -373,7 +387,6 @@ jobs:
 
           find tmp_downloads -name "*.part" -delete
 
-          # اعتبارسنجی فایل‌های دانلودشده
           echo "::group::Validating downloaded file(s)"
           for FILE in tmp_downloads/*; do
             [ -f "$FILE" ] || continue
@@ -388,11 +401,11 @@ jobs:
 
           MISMATCH_REASON=""
           if grep -qi "SABR-only\|missing a URL\|SABR" "$YT_LOG"; then
-            MISMATCH_REASON="YouTube SABR experiment limited available formats; higher qualities may be blocked."
+            MISMATCH_REASON="YouTube SABR experiment limited available formats."
           elif grep -qi "sign in to confirm your age\|age.restricted\|age restricted" "$YT_LOG"; then
-            MISMATCH_REASON="Video is age-restricted; login required for full quality. Consider enabling cookies."
+            MISMATCH_REASON="Video is age-restricted; login required for full quality."
           elif grep -qi "HTTP Error 403\|Forbidden" "$YT_LOG"; then
-            MISMATCH_REASON="Access denied (403 Forbidden); possibly geo-restricted or bot detection triggered."
+            MISMATCH_REASON="Access denied (403 Forbidden); possibly geo-restricted or bot detection."
           elif grep -qi "This video is private\|Video unavailable" "$YT_LOG"; then
             MISMATCH_REASON="Video may be private or unavailable in your region."
           else
@@ -405,7 +418,7 @@ jobs:
             VIDEO_FILE=$(find tmp_downloads -type f ! -name "*.part" -size +0 2>/dev/null | head -1)
             if [ -n "$VIDEO_FILE" ]; then
               HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VIDEO_FILE" 2>/dev/null | head -1)
-              if [ -n "$HEIGHT" ] && [ "$HEIGHT" -eq "$HEIGHT" ] 2>/dev/null; then
+              if [ -n "$HEIGHT" ] && [ "$HEIGHT" -ge 0 ] 2>/dev/null; then
                 if [ "$HEIGHT" -lt "$QUALITY" ]; then
                   QUALITY_MISMATCH=true
                   ACTUAL_QUALITY_DESC="${HEIGHT}p"
@@ -468,11 +481,12 @@ jobs:
               fi
             fi
 
+            # ⭐ استفاده از SPLIT_BYTES به جای عدد ثابت
             if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
-              echo "Splitting $BASENAME into ${SPLIT_MB}MB parts..."
+              echo "Splitting $BASENAME into ${SPLIT_SIZE_INPUT}MB parts..."
               ARCHIVE_BASE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}"
               [ -n "$ZIP_PASSWORD" ] && PASS_ARG="-p${ZIP_PASSWORD} -mhe=on" || PASS_ARG=""
-              7z a -v${SPLIT_MB}m $PASS_ARG ${COMPRESS_FLAG} "${ARCHIVE_BASE}.7z" "$FILE"
+              7z a -v${SPLIT_SIZE_INPUT}m $PASS_ARG ${COMPRESS_FLAG} "${ARCHIVE_BASE}.7z" "$FILE"
 
               PART_COUNT=$(ls "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.7z* 2>/dev/null | wc -l)
               TOTAL_SIZE=0
@@ -564,6 +578,12 @@ jobs:
           rm -rf tmp_downloads
           echo "Backup dir contents:"; find "$BACKUP_DIR" -type f | head -50
           cat /tmp/video_info.txt
+
+      - name: Stop PO Token Provider
+        if: always()
+        run: |
+          docker stop bgutil-provider 2>/dev/null || true
+          docker rm bgutil-provider 2>/dev/null || true
 
       - name: Stop Cloudflare WARP container
         if: always()

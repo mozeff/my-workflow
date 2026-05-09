@@ -12,6 +12,21 @@ on:
         required: false
         type: string
         default: ''
+      include_screenshot:
+        description: 'Take a full-page screenshot?'
+        required: false
+        type: boolean
+        default: true
+      download_media:
+        description: 'Download images and other media files?'
+        required: false
+        type: boolean
+        default: true
+      split_size:
+        description: 'Max size per part (MB) – 0 or empty = no split (default 90)'
+        required: false
+        type: string
+        default: '90'
 
 jobs:
   browse:
@@ -26,14 +41,16 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl zip
+          sudo apt-get install -y -qq curl zip imagemagick
 
       - name: Setup Node.js and Puppeteer
+        if: ${{ github.event.inputs.include_screenshot == 'true' || github.event.inputs.download_media == 'true' }}
         run: |
           npm init -y > /dev/null
           npm install puppeteer > /dev/null
 
       - name: Create screenshot & HTML extractor script
+        if: ${{ github.event.inputs.include_screenshot == 'true' || github.event.inputs.download_media == 'true' }}
         run: |
           cat > screenshot.js << 'EOF'
           const puppeteer = require('puppeteer');
@@ -41,10 +58,11 @@ jobs:
           const url = process.argv[2];
           const screenshotPath = process.argv[3];
           const htmlPath = process.argv[4];
+          const doScreenshot = process.argv[5] === 'true';
 
           (async () => {
             const browser = await puppeteer.launch({
-              headless: true,  // use 'new' if your puppeteer version requires it
+              headless: true,
               args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             });
             const page = await browser.newPage();
@@ -53,7 +71,7 @@ jobs:
             try {
               await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-              // Optional: scroll to load lazy content
+              // اسکرول برای بارگذاری تنبل (همیشه انجام شود، حتی اگر اسکرین‌شات نگیریم)
               await page.evaluate(async () => {
                 await new Promise((resolve) => {
                   let totalHeight = 0;
@@ -68,14 +86,15 @@ jobs:
                   }, 150);
                 });
               });
-              // Wait a moment for lazy-loaded images/media
               await page.waitForTimeout(2000);
 
-              // Screenshot
-              await page.screenshot({ path: screenshotPath, fullPage: true });
-              console.log('Screenshot saved successfully');
+              // اسکرین‌شات فقط در صورت درخواست
+              if (doScreenshot) {
+                await page.screenshot({ path: screenshotPath, fullPage: true });
+                console.log('Screenshot saved successfully');
+              }
 
-              // Get fully rendered HTML
+              // استخراج HTML رندر شده (همیشه)
               const html = await page.content();
               fs.writeFileSync(htmlPath, html);
               console.log('Rendered HTML saved successfully');
@@ -93,6 +112,8 @@ jobs:
         run: |
           set -euo pipefail
           RAW_URL="${{ github.event.inputs.url }}"
+          INCLUDE_SCREENSHOT="${{ github.event.inputs.include_screenshot }}"
+          DOWNLOAD_MEDIA="${{ github.event.inputs.download_media }}"
 
           if [[ ! "$RAW_URL" =~ ^https?:// ]]; then
             HTTPS_URL="https://$RAW_URL"
@@ -105,7 +126,7 @@ jobs:
             URL="$RAW_URL"
           fi
 
-          # --- توابع تولید نام تصادفی عددی (بدون تغییر) ---
+          # --- توابع تولید نام تصادفی عددی ---
           generate_random_numeric_name() {
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
@@ -128,80 +149,103 @@ jobs:
           MEDIA_DIR="$FOLDER/media"
           mkdir -p "$FOLDER" "$MEDIA_DIR"
 
-          # لاگ را فاقد URL واقعی می‌کنیم
           echo "Processing session ID: $FOLDER_NAME"
 
-          # ------------------------------------------------------------
-          # Puppeteer steps (unchanged)
-          # ------------------------------------------------------------
           SCREENSHOT_OK=false
           HTML_OK=false
 
-          if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html"; then
-            SCREENSHOT_OK=true
-            HTML_OK=true
-            echo "Puppeteer succeeded: Screenshot and rendered HTML saved."
+          # تصمیم‌گیری درباره نیاز به Puppeteer
+          NEED_PUPPETEER=false
+          if [ "$INCLUDE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_MEDIA" = "true" ]; then
+            NEED_PUPPETEER=true
+          fi
+
+          if $NEED_PUPPETEER; then
+            echo "Running Puppeteer (screenshot=$INCLUDE_SCREENSHOT, media=$DOWNLOAD_MEDIA)..."
+            if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html" "$INCLUDE_SCREENSHOT"; then
+              HTML_OK=true
+              if [ "$INCLUDE_SCREENSHOT" = "true" ]; then
+                SCREENSHOT_OK=true
+              fi
+              echo "Puppeteer succeeded: HTML saved. Screenshot: $SCREENSHOT_OK"
+            else
+              echo "Puppeteer failed. Falling back to curl for raw HTML."
+              curl -sSL -A "Mozilla/5.0" -o "$FOLDER/page.html" "$URL" || {
+                echo "Failed to download HTML, creating placeholder"
+                echo "<html><body>Failed to load $URL</body></html>" > "$FOLDER/page.html"
+              }
+            fi
           else
-            echo "Puppeteer failed. Falling back to curl for raw HTML."
+            # بدون نیاز به Puppeteer، فقط raw HTML دانلود می‌شود
+            echo "Skipping Puppeteer, downloading raw HTML with curl."
             curl -sSL -A "Mozilla/5.0" -o "$FOLDER/page.html" "$URL" || {
               echo "Failed to download HTML, creating placeholder"
               echo "<html><body>Failed to load $URL</body></html>" > "$FOLDER/page.html"
             }
           fi
 
-          grep -ohP '(?:href|src)="\K[^"]*' "$FOLDER/page.html" | sort -u > "$FOLDER/all_links.txt"
+          # استخراج و دانلود مدیا فقط در صورت فعال بودن
+          if [ "$DOWNLOAD_MEDIA" = "true" ]; then
+            echo "Extracting and downloading media files..."
+            grep -ohP '(?:href|src)="\K[^"]*' "$FOLDER/page.html" | sort -u > "$FOLDER/all_links.txt"
 
-          MEDIA_EXT='png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|zip|rar|tar|gz|7z'
+            MEDIA_EXT='png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|zip|rar|tar|gz|7z'
 
-          > "$FOLDER/media_links.txt"
-          > "$FOLDER/other_links.txt"
-          > "$FOLDER/downloaded_media.md"
-          echo "## Downloaded Media Files" > "$FOLDER/downloaded_media.md"
-          echo "" >> "$FOLDER/downloaded_media.md"
+            > "$FOLDER/media_links.txt"
+            > "$FOLDER/other_links.txt"
+            > "$FOLDER/downloaded_media.md"
+            echo "## Downloaded Media Files" > "$FOLDER/downloaded_media.md"
+            echo "" >> "$FOLDER/downloaded_media.md"
 
-          BASE_PROTOCOL_DOMAIN="$(echo "$URL" | awk -F/ '{print $1"//"$3}')"
+            BASE_PROTOCOL_DOMAIN="$(echo "$URL" | awk -F/ '{print $1"//"$3}')"
 
-          while IFS= read -r link; do
-            [[ -z "$link" || "$link" =~ ^# ]] && continue
-            if [[ "$link" =~ ^https?:// ]]; then
-              ABS_URL="$link"
-            elif [[ "$link" = /* ]]; then
-              ABS_URL="${BASE_PROTOCOL_DOMAIN}${link}"
-            else
-              ABS_URL="${BASE_PROTOCOL_DOMAIN}/${link}"
-            fi
+            while IFS= read -r link; do
+              [[ -z "$link" || "$link" =~ ^# ]] && continue
+              if [[ "$link" =~ ^https?:// ]]; then
+                ABS_URL="$link"
+              elif [[ "$link" = /* ]]; then
+                ABS_URL="${BASE_PROTOCOL_DOMAIN}${link}"
+              else
+                ABS_URL="${BASE_PROTOCOL_DOMAIN}/${link}"
+              fi
 
-            ext="${link##*.}"
-            ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+              ext="${link##*.}"
+              ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
 
-            if echo "$ext_lower" | grep -Eq "^($MEDIA_EXT)$"; then
-              echo "Downloading: $ABS_URL"
-              SAFE_NAME=$(basename "$link" | sed 's/[?#].*//; s/[^a-zA-Z0-9._-]/_/g')
-              [[ ! -f "$MEDIA_DIR/$SAFE_NAME" ]] || SAFE_NAME="dup_$(date +%s)_${SAFE_NAME}"
+              if echo "$ext_lower" | grep -Eq "^($MEDIA_EXT)$"; then
+                echo "Downloading: $ABS_URL"
+                SAFE_NAME=$(basename "$link" | sed 's/[?#].*//; s/[^a-zA-Z0-9._-]/_/g')
+                [[ ! -f "$MEDIA_DIR/$SAFE_NAME" ]] || SAFE_NAME="dup_$(date +%s)_${SAFE_NAME}"
 
-              if curl -sSL --retry 2 --max-time 60 -o "$MEDIA_DIR/$SAFE_NAME" "$ABS_URL"; then
-                SIZE=$(stat -c%s "$MEDIA_DIR/$SAFE_NAME" 2>/dev/null || echo 0)
-                if [[ "$SIZE" -gt 0 ]]; then
-                  echo "$link" >> "$FOLDER/media_links.txt"
-                  if [[ "$ext_lower" =~ ^(png|jpg|jpeg|gif|svg|webp)$ ]]; then
-                    echo "![$SAFE_NAME](./media/$SAFE_NAME)" >> "$FOLDER/downloaded_media.md"
-                  else
-                    echo "- [$SAFE_NAME](./media/$SAFE_NAME) (${SIZE} bytes)" >> "$FOLDER/downloaded_media.md"
+                if curl -sSL --retry 2 --max-time 60 -o "$MEDIA_DIR/$SAFE_NAME" "$ABS_URL"; then
+                  SIZE=$(stat -c%s "$MEDIA_DIR/$SAFE_NAME" 2>/dev/null || echo 0)
+                  if [[ "$SIZE" -gt 0 ]]; then
+                    echo "$link" >> "$FOLDER/media_links.txt"
+                    if [[ "$ext_lower" =~ ^(png|jpg|jpeg|gif|svg|webp)$ ]]; then
+                      echo "![$SAFE_NAME](./media/$SAFE_NAME)" >> "$FOLDER/downloaded_media.md"
+                    else
+                      echo "- [$SAFE_NAME](./media/$SAFE_NAME) (${SIZE} bytes)" >> "$FOLDER/downloaded_media.md"
+                    fi
+                    echo "  OK: $SAFE_NAME"
                   fi
-                  echo "  OK: $SAFE_NAME"
+                else
+                  echo "  Failed: $ABS_URL"
                 fi
               else
-                echo "  Failed: $ABS_URL"
+                echo "$link" >> "$FOLDER/other_links.txt"
               fi
-            else
-              echo "$link" >> "$FOLDER/other_links.txt"
-            fi
-          done < "$FOLDER/all_links.txt"
+            done < "$FOLDER/all_links.txt"
+            MEDIA_COUNT=$(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l)
+            echo "Media downloaded: $MEDIA_COUNT files"
+          else
+            MEDIA_COUNT=0
+            # ایجاد فایل‌های خالی برای جلوگیری از خطا
+            touch "$FOLDER/all_links.txt"
+            echo "" > "$FOLDER/downloaded_media.md"
+          fi
 
-          # Create index.md **without exposing the original URL**
-          MEDIA_COUNT=$(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l)
+          # ساخت index.md
           {
-            # به جای URL از شناسه تصادفی استفاده می‌کنیم
             echo "# Session ID: $FOLDER_NAME"
             echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo ""
@@ -213,18 +257,20 @@ jobs:
             echo "## HTML Source"
             echo "[page.html](./page.html)  ($(wc -c < "$FOLDER/page.html") bytes)"
             echo ""
-            echo "## Downloaded Media ($MEDIA_COUNT files)"
-            if [[ "$MEDIA_COUNT" -gt 0 ]]; then
-              cat "$FOLDER/downloaded_media.md"
-            else
-              echo "_No media files downloaded_"
-            fi
-            echo ""
-            echo "## Other Links"
-            if [[ -s "$FOLDER/other_links.txt" ]]; then
-              head -50 "$FOLDER/other_links.txt" | while IFS= read -r entry; do
-                echo "- [$entry]($entry)"
-              done
+            if [ "$DOWNLOAD_MEDIA" = "true" ]; then
+              echo "## Downloaded Media ($MEDIA_COUNT files)"
+              if [[ "$MEDIA_COUNT" -gt 0 ]]; then
+                cat "$FOLDER/downloaded_media.md"
+              else
+                echo "_No media files downloaded_"
+              fi
+              echo ""
+              echo "## Other Links"
+              if [[ -s "$FOLDER/other_links.txt" ]]; then
+                head -50 "$FOLDER/other_links.txt" | while IFS= read -r entry; do
+                  echo "- [$entry]($entry)"
+                done
+              fi
             fi
             echo ""
             echo "## Stats"
@@ -232,36 +278,106 @@ jobs:
             echo "- Media downloaded: $MEDIA_COUNT"
           } > "$FOLDER/index.md"
 
-          # اصلاح browse.md برای اشاره به فایل zip به‌جای پوشه
+          # اصلاح browse.md
           BROWSE_FILE="browse.md"
           if [[ ! -f "$BROWSE_FILE" ]]; then
             echo "# Browsed Websites" > "$BROWSE_FILE"
             echo "" >> "$BROWSE_FILE"
           fi
-          echo "- [$FOLDER_NAME](./pages/${FOLDER_NAME}.zip) — $MEDIA_COUNT media files (zip archive)" >> "$BROWSE_FILE"
+          echo "- [${FOLDER_NAME}](./pages/${FOLDER_NAME}.md) — $MEDIA_COUNT media files" >> "$BROWSE_FILE"
 
           echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
+          echo "Session complete."
 
-          echo "Done: $MEDIA_COUNT media files saved."
-
-      - name: Create zip archive (with optional encryption) and remove folder
+      - name: Package and optionally split
         if: success()
         env:
           ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
+          SPLIT_SIZE_MB: ${{ github.event.inputs.split_size }}
         run: |
           FOLDER_NAME="${{ env.FOLDER_NAME }}"
-          cd pages
-          if [ -d "$FOLDER_NAME" ]; then
-            if [ -n "$ZIP_PASSWORD" ]; then
-              echo "Creating encrypted ZIP..."
-              zip -qr -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$FOLDER_NAME"
-            else
-              echo "No password provided – creating unencrypted ZIP."
-              zip -qr "${FOLDER_NAME}.zip" "$FOLDER_NAME"
-            fi
-            # حذف پوشهٔ اصلی؛ فقط فایل zip می‌ماند
-            rm -rf "$FOLDER_NAME"
+          SPLIT_SIZE_MB="${SPLIT_SIZE_MB:-0}"
+          # اگر 0 یا غیرعددی باشد، split انجام نشود
+          if ! [[ "$SPLIT_SIZE_MB" =~ ^[0-9]+$ ]] || [ "$SPLIT_SIZE_MB" -le 0 ]; then
+            SPLIT_SIZE_MB=0
           fi
+
+          cd pages
+          if [ ! -d "$FOLDER_NAME" ]; then
+            echo "Folder not found!"
+            exit 1
+          fi
+
+          TOTAL_SIZE=$(du -sb "$FOLDER_NAME" | cut -f1)
+          ZIP_NAME="${FOLDER_NAME}.zip"
+
+          # تابع urlencode
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          if [ "$SPLIT_SIZE_MB" -gt 0 ] && [ "$TOTAL_SIZE" -gt $((SPLIT_SIZE_MB * 1024 * 1024)) ]; then
+            echo "Total size $(echo "scale=2; $TOTAL_SIZE/1048576" | bc) MB exceeds ${SPLIT_SIZE_MB}MB – splitting..."
+            if [ -n "$ZIP_PASSWORD" ]; then
+              zip -s ${SPLIT_SIZE_MB}m -r -P "$ZIP_PASSWORD" "${ZIP_NAME}" "$FOLDER_NAME"
+            else
+              zip -s ${SPLIT_SIZE_MB}m -r "${ZIP_NAME}" "$FOLDER_NAME"
+            fi
+            # پارت‌ها: .zip , .z01, .z02, ...
+            PARTS=$(ls ${FOLDER_NAME}.z* ${ZIP_NAME} 2>/dev/null | sort)
+            echo "Split archive parts:"
+            echo "$PARTS"
+          else
+            echo "Creating single zip (no split)..."
+            if [ -n "$ZIP_PASSWORD" ]; then
+              zip -qr -P "$ZIP_PASSWORD" "${ZIP_NAME}" "$FOLDER_NAME"
+            else
+              zip -qr "${ZIP_NAME}" "$FOLDER_NAME"
+            fi
+            PARTS="${ZIP_NAME}"
+          fi
+
+          # حذف پوشه اصلی
+          rm -rf "$FOLDER_NAME"
+
+          # ساخت فایل .md برای اطلاع‌رسانی و لینک‌ها
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          BASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${BRANCH}/pages"
+          FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+
+          {
+            echo "# Session: $FOLDER_NAME"
+            echo ""
+            echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "## Download"
+            echo ""
+            if echo "$PARTS" | grep -q '\.z[0-9]'; then
+              echo "Archive split into multiple parts (${SPLIT_SIZE_MB} MB each):"
+              echo ""
+              echo "| # | File | Download |"
+              echo "|---|------|----------|"
+              i=1
+              for part in $PARTS; do
+                echo "| $i | \`$part\` | [📥](${BASE_URL}/$(urlencode "$part")) |"
+                i=$((i+1))
+              done
+              echo ""
+              echo "**To extract:** Download all parts and open \`${ZIP_NAME}\` with 7-Zip or WinRAR."
+            else
+              echo "Single archive: [${ZIP_NAME}](${BASE_URL}/$(urlencode "${ZIP_NAME}"))"
+            fi
+            if [ -n "$ZIP_PASSWORD" ]; then
+              echo ""
+              echo "**Password:** \`***\` (set by user)"
+            fi
+            echo ""
+            echo "---"
+            echo "*Generated by GitHub Actions*"
+          } > "${FOLDER_NAME}.md"
+
           cd "$GITHUB_WORKSPACE"
 
       - name: Commit and push results
@@ -269,13 +385,13 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          # فقط فایل‌های مورد نیاز: پوشه pages (فقط حاوی فایل zip خواهد بود) و browse.md
+
           git add pages/ browse.md
           if git diff --staged --quiet; then
             echo "No changes to commit"
             exit 0
           fi
-          # کامیت بدون افشای URL
-          git commit -m "[Browse] Snapshot ${{ env.FOLDER_NAME }} [skip ci]"
+
+          git commit -m "[Browse] Session ${{ env.FOLDER_NAME }} [skip ci]"
           git pull --rebase origin "${{ github.ref_name }}"
           git push origin HEAD:"${{ github.ref_name }}"

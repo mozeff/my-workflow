@@ -13,7 +13,7 @@ on:
         default: ''
         type: string
       split_size:
-        description: 'Maximum part size in MB (default 80)'
+        description: 'Max part size in MB (no upper limit, but >100MB may require Git LFS to push)'
         required: false
         default: '80'
         type: string
@@ -272,12 +272,13 @@ jobs:
           safe_name = result['safe_name']
           original = result['original']
           size = result['size']
-          password = """${{ github.event.inputs.password }}"""
+          password = """${{ github.event.inputs.password }}""" 
           split_size_mb = int("""${{ github.event.inputs.split_size }}""" or 80)
-          if split_size_mb <= 0 or split_size_mb > 1900:
+          if split_size_mb <= 0:
+              print("Invalid split size, using default 80")
               split_size_mb = 80
-          MAX_PART = 80
-          part_mb = min(split_size_mb, MAX_PART)
+          # توجه: برای push بدون Git LFS، مقدار را زیر ۱۰۰ نگه دارید
+          part_mb = split_size_mb   # no upper limit enforced
 
           folder_path = os.path.join('downloads', folder)
           file_path = os.path.join(folder_path, safe_name)
