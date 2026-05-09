@@ -1,4 +1,4 @@
-name: ⬇️ 09-Download from URL
+name: ⬇️ 09-Multi download from URL
 
 on:
   workflow_dispatch:
@@ -50,6 +50,16 @@ on:
         required: false
         type: boolean
         default: false
+      delay:
+        description: 'Delay between each URL (seconds)'
+        required: false
+        default: '3'
+        type: number
+      add_jitter:
+        description: 'Add random 0-1 second jitter to the delay'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   save-file:
@@ -74,13 +84,11 @@ jobs:
           git config --global pack.threads 1
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          echo "Git configured for large file handling"
 
       - name: Install required packages
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 zip curl bc imagemagick
-          # اگر حداقل یکی از گزینه‌های اسکرین‌شات یا تصاویر فعال باشد Node.js و puppeteer نصب شود
           if [ "${{ github.event.inputs.take_screenshot }}" = "true" ] || [ "${{ github.event.inputs.download_images }}" = "true" ]; then
             echo "Installing Node.js for scraping..."
             curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
@@ -98,9 +106,13 @@ jobs:
           SPLIT_THRESHOLD_MB=${{ github.event.inputs.split_size }}
           TAKE_SCREENSHOT="${{ github.event.inputs.take_screenshot }}"
           DOWNLOAD_IMAGES="${{ github.event.inputs.download_images }}"
+          DELAY=${{ github.event.inputs.delay }}
+          ADD_JITTER="${{ github.event.inputs.add_jitter }}"
 
+          if ! [[ "$DELAY" =~ ^[0-9]+$ ]] || [ "$DELAY" -lt 0 ]; then
+            DELAY=0
+          fi
           if ! [[ "$SPLIT_THRESHOLD_MB" =~ ^[0-9]+$ ]] || [ "$SPLIT_THRESHOLD_MB" -le 0 ]; then
-            echo "Invalid part size, using default 45"
             SPLIT_THRESHOLD_MB=45
           fi
           SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
@@ -119,7 +131,6 @@ jobs:
           BACKUP_DIR="/tmp/download_backup_$$"
           mkdir -p "$BACKUP_DIR"
           echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
-
           mkdir -p tmp_downloads
 
           # --- توابع کمکی ---
@@ -145,60 +156,31 @@ jobs:
           }
 
           download_with_retry() {
-            local URL="$1"
-            local FILENAME="$2"
+            local URL="$1" FILENAME="$2"
             local MAX_RETRIES=3
             local SUCCESS=false
-            local ERROR_LOG=""
-
             rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
 
             for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
               echo "Attempt $attempt of $MAX_RETRIES for $FILENAME"
-              ERROR_LOG=$(aria2c \
-                --split=2 \
-                --max-connection-per-server=2 \
-                --min-split-size=20M \
-                --max-tries=3 \
-                --retry-wait=5 \
-                --timeout=60 \
-                --connect-timeout=30 \
-                --follow-torrent=false \
-                --check-certificate=false \
-                --allow-overwrite=true \
-                --auto-file-renaming=false \
-                --dir="tmp_downloads" \
-                --out="$FILENAME" \
-                "$URL" 2>&1)
-
+              aria2c --split=2 --max-connection-per-server=2 --min-split-size=20M \
+                --max-tries=3 --retry-wait=5 --timeout=60 --connect-timeout=30 \
+                --follow-torrent=false --check-certificate=false --allow-overwrite=true \
+                --auto-file-renaming=false --dir="tmp_downloads" --out="$FILENAME" "$URL" 2>/dev/null
               if [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
-                SUCCESS=true
-                break
+                SUCCESS=true; break
               fi
-
               rm -f "tmp_downloads/$FILENAME"
-              ERROR_LOG=$(curl -L -f -# \
-                --retry 3 \
-                --retry-delay 5 \
-                --connect-timeout 30 \
-                --max-time 3600 \
-                -A "Mozilla/5.0" \
-                -o "tmp_downloads/$FILENAME" \
-                "$URL" 2>&1)
+              curl -L -f -# --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 3600 \
+                -A "Mozilla/5.0" -o "tmp_downloads/$FILENAME" "$URL" 2>/dev/null
               if [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
-                SUCCESS=true
-                break
+                SUCCESS=true; break
               fi
               sleep 5
             done
 
-            if [ "$SUCCESS" = true ]; then
-              return 0
-            else
-              echo "Download failed: $FILENAME"
-              rm -f "tmp_downloads/$FILENAME"
-              return 1
-            fi
+            if [ "$SUCCESS" = true ]; then return 0
+            else echo "Download failed: $FILENAME"; rm -f "tmp_downloads/$FILENAME"; return 1; fi
           }
 
           compress_image() {
@@ -209,13 +191,11 @@ jobs:
             local NEW_SIZE=$(stat -c%s "$IMG.compressed")
             if [ "$NEW_SIZE" -lt "$ORIG_SIZE" ] && [ "$NEW_SIZE" -gt 0 ]; then
               mv "$IMG.compressed" "$IMG"
-              echo "  Reduced: $ORIG_SIZE -> $NEW_SIZE bytes"
             else
-              echo "  No reduction, kept original"
               rm -f "$IMG.compressed"
             fi
           }
-          
+
           if [ "$TAKE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_IMAGES" = "true" ]; then
             cat > scrape.js << 'EOF'
           const puppeteer = require('puppeteer');
@@ -227,21 +207,15 @@ jobs:
 
           (async () => {
             const browser = await puppeteer.launch({
-              headless: true,
-              args: ['--no-sandbox', '--disable-setuid-sandbox']
+              headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox']
             });
             const page = await browser.newPage();
             await page.setViewport({ width: 1280, height: 720 });
-
             try {
               await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-
               if (doScreenshot) {
-                const shotPath = `tmp_downloads/screenshot_${idx}.png`;
-                await page.screenshot({ path: shotPath, fullPage: true });
-                console.log(`Screenshot saved: ${shotPath}`);
+                await page.screenshot({ path: `tmp_downloads/screenshot_${idx}.png`, fullPage: true });
               }
-
               if (doImages) {
                 const imgUrls = await page.evaluate(() =>
                   Array.from(document.querySelectorAll('img'))
@@ -256,65 +230,70 @@ jobs:
                     if (response && response.ok) {
                       const buffer = await response.buffer();
                       fs.writeFileSync(dest, buffer);
-                      console.log(`Image downloaded: ${dest}`);
+                      console.log(`Image saved: ${dest}`);
                     }
-                  } catch (e) {
-                    console.log(`Failed to download image: ${imgUrl}`);
-                  }
+                  } catch (e) { console.log(`Image failed: ${imgUrl}`); }
                 }
               }
-            } catch (err) {
-              console.error(`Scrape error for ${url}: ${err.message}`);
-            } finally {
-              await browser.close();
-            }
+            } catch (err) { console.error(`Scrape error: ${err.message}`); }
+            finally { await browser.close(); }
           })();
           EOF
           fi
 
-          # --- پردازش هر URL ---
+          # پردازش URLها با تأخیر
+          read -ra URL_ARRAY <<< "$URLS"
+          TOTAL_URLS=${#URL_ARRAY[@]}
+
           idx=0
-          for URL in $URLS; do
+          for URL in "${URL_ARRAY[@]}"; do
             idx=$((idx + 1))
 
-            # ۱. اجرای اسکریپت scrape در صورت نیاز
             if [ "$TAKE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_IMAGES" = "true" ]; then
-              echo "🌐 Scraping page #$idx: $URL"
-              node scrape.js "$URL" "$idx" "$TAKE_SCREENSHOT" "$DOWNLOAD_IMAGES" || echo "⚠️ Scrape failed for $URL"
+              echo "🌐 Scraping page #$idx/$TOTAL_URLS: $URL"
+              node scrape.js "$URL" "$idx" "$TAKE_SCREENSHOT" "$DOWNLOAD_IMAGES" || true
             fi
 
-            # ۲. دانلود مستقیم URL به عنوان فایل (حالت قبلی)
-            FILENAME=$(basename "$URL" | sed 's/%20/ /g' | sed 's/%2F/-/g' | sed 's/[?#].*//')
-            FILENAME=$(echo "$FILENAME" | sed 's/[<>:"|?*]/_/g')
-            echo "📥 Direct download #$idx: $URL -> $FILENAME"
-            download_with_retry "$URL" "$FILENAME" || echo "Failed direct download: $FILENAME"
+            FILENAME=$(basename "$URL" | sed 's/%20/ /g; s/%2F/-/g; s/[?#].*//' | sed 's/[<>:"|?*]/_/g')
+            echo "📥 Direct download #$idx/$TOTAL_URLS: $URL -> $FILENAME"
+            download_with_retry "$URL" "$FILENAME" || true
+
+            if [ $idx -lt $TOTAL_URLS ] && ([ "$DELAY" -gt 0 ] || [ "$ADD_JITTER" = "true" ]); then
+              SLEEP_TIME=$DELAY
+              if [ "$ADD_JITTER" = "true" ]; then
+                SLEEP_TIME=$(( DELAY + RANDOM % 2 ))
+              fi
+              echo "⏳ Waiting ${SLEEP_TIME}s before next URL..."
+              sleep $SLEEP_TIME
+            fi
           done
 
-          # --- فشرده‌سازی تصاویر (روی همه فایل‌های تصویری موجود) ---
+          # فشرده‌سازی تصاویر
           if [ "$COMPRESS_IMAGES" = "true" ]; then
             echo "====== Compressing images ======"
             find tmp_downloads -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" -o -iname "*.bmp" \) -exec bash -c 'compress_image "$0"' {} \;
           fi
 
-          # --- بسته‌بندی و تولید README (بدون تغییر) ---
+          # بسته‌بندی و ساخت README (فقط حجم ZIP)
           for FILE in tmp_downloads/*; do
             [ -f "$FILE" ] || continue
             SIZE=$(stat -c%s "$FILE")
             BASENAME=$(basename "$FILE")
             FOLDER_NAME=$(get_unique_numeric_folder)
             mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
-            FOLDER_ENCODED=$(urlencode "${FOLDER_NAME}")
+            FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
 
             if [ "$MODE" = "none" ]; then
+              # حالت بدون بسته‌بندی – فقط فایل اصلی کپی می‌شود
               mv "$FILE" "$BACKUP_DIR/$FOLDER_NAME/$BASENAME"
-              RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "$BASENAME")"
-              {
-                echo "# $BASENAME"
-                echo "Size: $(echo "scale=2; $SIZE/1024/1024" | bc) MB"
-                echo "Status: Complete"
-                echo "Download: [${BASENAME}](${RAW_LINK})"
-              } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
-              echo "Stored raw: $BASENAME"
+              SIZE_MB=$(echo "scale=2; $SIZE/1048576" | bc)
+              printf '%s\n' \
+                "# Downloaded file" \
+                "" \
+                "Size: ${SIZE_MB} MB" \
+                "" \
+                "[Direct download](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "$BASENAME"))" \
+                > "$BACKUP_DIR/$FOLDER_NAME/README.md"
 
             elif [ "$MODE" = "zip" ]; then
               if [ -n "$ZIP_PASSWORD" ]; then
@@ -323,20 +302,18 @@ jobs:
                 zip -j "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
               fi
               ZIP_SIZE=$(stat -c%s "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip")
-              ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1024/1024" | bc)
-              RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "${FOLDER_NAME}.zip")"
-              {
-                echo "# $BASENAME (ZIP)"
-                echo "Original size: $(echo "scale=2; $SIZE/1024/1024" | bc) MB"
-                echo "ZIP size: ${ZIP_MB} MB"
-                echo "Status: Complete"
-                echo "Download: [${FOLDER_NAME}.zip](${RAW_LINK})"
-              } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
-              echo "Created zip: ${FOLDER_NAME}.zip"
+              ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
+              printf '%s\n' \
+                "# Compressed file" \
+                "" \
+                "ZIP size: ${ZIP_MB} MB" \
+                "" \
+                "[Download ZIP](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "${FOLDER_NAME}.zip"))" \
+                > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+              rm -f "$FILE"
 
             elif [ "$MODE" = "split" ]; then
               if [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
-                echo "$BASENAME is large, splitting into ${SPLIT_THRESHOLD_MB}MB parts"
                 cd tmp_downloads
                 if [ -n "$ZIP_PASSWORD" ]; then
                   zip -0 -s "${SPLIT_THRESHOLD_MB}m" -P "$ZIP_PASSWORD" "${FOLDER_NAME}.zip" "$BASENAME"
@@ -347,33 +324,41 @@ jobs:
                   [ -f "$part" ] && mv "$part" "$BACKUP_DIR/$FOLDER_NAME/"
                 done
                 cd ..
+                # محاسبه حجم کل قطعات
+                TOTAL_ZIP=0
+                for part in "$BACKUP_DIR/$FOLDER_NAME"/*; do
+                  [ -f "$part" ] && TOTAL_ZIP=$((TOTAL_ZIP + $(stat -c%s "$part")))
+                done
+                TOTAL_ZIP_MB=$(echo "scale=2; $TOTAL_ZIP/1048576" | bc)
+                # ساخت README (فقط حجم کل)
                 {
-                  echo "# $BASENAME (split)"
-                  echo "Parts:"
-                  for part_file in "$BACKUP_DIR/$FOLDER_NAME"/*; do
-                    [ -f "$part_file" ] || continue
-                    part_name=$(basename "$part_file")
-                    part_link="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "$part_name")"
-                    echo "- [${part_name}](${part_link})"
+                  echo "# Split ZIP archive"
+                  echo "Total size: ${TOTAL_ZIP_MB} MB"
+                  echo ""
+                  for part in "$BACKUP_DIR/$FOLDER_NAME"/*; do
+                    [ -f "$part" ] || continue
+                    part_name=$(basename "$part")
+                    echo "[${part_name}](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "$part_name"))"
                   done
-                  echo "Download all parts and extract the first .zip"
                 } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
               else
+                # فایل کوچک – همانند zip معمولی
                 if [ -n "$ZIP_PASSWORD" ]; then
                   zip -j -P "$ZIP_PASSWORD" "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
                 else
                   zip -j "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip" "$FILE"
                 fi
                 ZIP_SIZE=$(stat -c%s "$BACKUP_DIR/$FOLDER_NAME/${FOLDER_NAME}.zip")
-                ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1024/1024" | bc)
-                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "${FOLDER_NAME}.zip")"
-                {
-                  echo "# $BASENAME (ZIP)"
-                  echo "Size: ${ZIP_MB} MB"
-                  echo "Download: [${FOLDER_NAME}.zip](${RAW_LINK})"
-                } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+                ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
+                printf '%s\n' \
+                  "# Compressed file" \
+                  "" \
+                  "ZIP size: ${ZIP_MB} MB" \
+                  "" \
+                  "[Download ZIP](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/$(urlencode "${FOLDER_NAME}.zip"))" \
+                  > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+                rm -f "$FILE"
               fi
-              rm -f "$FILE"
             fi
           done
 
@@ -397,6 +382,7 @@ jobs:
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
 
+          # ساخت فهرست کلی با نمایش فقط حجم ZIP
           {
             echo "# Downloaded list :"
             echo ""
@@ -404,12 +390,26 @@ jobs:
               [ -d "$folder" ] || continue
               FNAME=$(basename "$folder")
               FENCODED=$(urlencode "$FNAME")
-              echo "- [${FNAME}](./${FENCODED})"
+              # تشخیص فایل ZIP (حالت zip یا split)
+              if [ -f "$folder/${FNAME}.zip" ]; then
+                ZIP_SIZE=$(stat -c%s "$folder/${FNAME}.zip")
+              elif ls "$folder"/*.z[0-9]* 1>/dev/null 2>&1; then
+                # حالت split: جمع کل قطعات
+                ZIP_SIZE=0
+                for p in "$folder"/*.z*; do
+                  [ -f "$p" ] && ZIP_SIZE=$((ZIP_SIZE + $(stat -c%s "$p")))
+                done
+              else
+                ZIP_SIZE=0
+              fi
+              ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
+              echo "- [${ZIP_MB} MB](./${FENCODED})"
             done
             echo ""
             echo "---"
           } > downloads/README.md
 
+          # به‌روزرسانی README اصلی مخزن
           touch README.md
           sed -i '/^## Latest Downloads/,/^---$/d' README.md
           {
@@ -418,7 +418,18 @@ jobs:
               [ -d "$folder" ] || continue
               FNAME=$(basename "$folder")
               FENCODED=$(urlencode "$FNAME")
-              echo "- [${FNAME}](${REPO_URL}/${FENCODED})"
+              if [ -f "$folder/${FNAME}.zip" ]; then
+                ZIP_SIZE=$(stat -c%s "$folder/${FNAME}.zip")
+              elif ls "$folder"/*.z[0-9]* 1>/dev/null 2>&1; then
+                ZIP_SIZE=0
+                for p in "$folder"/*.z*; do
+                  [ -f "$p" ] && ZIP_SIZE=$((ZIP_SIZE + $(stat -c%s "$p")))
+                done
+              else
+                ZIP_SIZE=0
+              fi
+              ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
+              echo "- [${ZIP_MB} MB](${REPO_URL}/${FENCODED})"
             done
             echo "---"
           } >> README.md
