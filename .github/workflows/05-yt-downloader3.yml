@@ -181,11 +181,12 @@ jobs:
           fi
 
       # ─────────────────────────────────────────────────────────
-      # مرحله ۲: دانلود (با آرایه‌های صحیح و اعتبارسنجی)
+      # مرحله ۲: دانلود (با متد‌های مختلف و بدون خروج زودهنگام)
       # ─────────────────────────────────────────────────────────
       - name: Download YouTube video/audio
         run: |
-          set -euo pipefail
+          set -uo pipefail
+
           URL="${{ github.event.inputs.youtube_url }}"
           QUALITY="${{ github.event.inputs.quality }}"
           AUDIO_ONLY="${{ github.event.inputs.audio_only }}"
@@ -269,89 +270,97 @@ jobs:
 
           COMMON_FLAGS=(--output "tmp_downloads/%(title)s.%(ext)s" --no-part --no-playlist --retries 10 --fragment-retries 10 --no-check-certificates)
 
-          # متدهای دانلود (بدون مشکل نقل‌قول)
-          METHOD_1=(
-            "--proxy" "socks5://127.0.0.1:1080"
-            "--extractor-args" "youtube:player_client=ios"
-            "--user-agent" "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
-            "--concurrent-fragments" "4"
-          )
-          METHOD_2=(
-            "--proxy" "socks5://127.0.0.1:1080"
-            "--extractor-args" "youtube:player_client=web"
-            "--js-runtimes" "deno"
-            "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            "--add-header" "Accept-Language:en-US,en;q=0.9"
-          )
-          METHOD_3=(
-            "--proxy" "socks5://127.0.0.1:1080"
-            "--extractor-args" "youtube:player_client=mweb"
-            "--concurrent-fragments" "4"
-          )
-          METHOD_4=(
-            "--proxy" "socks5://127.0.0.1:1080"
-            "--extractor-args" "youtube:player_client=android"
-            "--user-agent" "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
-            "--concurrent-fragments" "4"
-          )
-          METHOD_5=(
-            "--proxy" "socks5://127.0.0.1:1080"
-            "--extractor-args" "youtube:player_client=mweb,android,ios"
-            "--concurrent-fragments" "4"
-          )
-          METHOD_6=(
-            "--extractor-args" "youtube:player_client=ios"
-            "--concurrent-fragments" "4"
-          )
-          METHOD_7=(
-            "--extractor-args" "youtube:player_client=web"
-            "--js-runtimes" "deno"
-            "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            "--add-header" "Accept-Language:en-US,en;q=0.9"
-          )
-          METHOD_8=(
-            "--extractor-args" "youtube:player_client=mweb"
-            "--concurrent-fragments" "4"
-          )
-          METHOD_9=(
-            "--extractor-args" "youtube:player_client=android"
-            "--concurrent-fragments" "4"
-          )
-          METHOD_10=(
-            "--proxy" "socks5://127.0.0.1:1080"
-            "--extractor-args" "youtube:player_client=mweb,android,ios,android_vr"
-            "--concurrent-fragments" "4"
-          )
-
-          METHOD_NAMES=(METHOD_1 METHOD_2 METHOD_3 METHOD_4 METHOD_5 METHOD_6 METHOD_7 METHOD_8 METHOD_9 METHOD_10)
+          # تابع برای ساخت آرایه آرگومان‌های هر متد
+          get_method_args() {
+            local meth="$1"
+            args=()
+            case "$meth" in
+              1)
+                args+=("--proxy" "socks5://127.0.0.1:1080")
+                args+=("--extractor-args" "youtube:player_client=ios")
+                args+=("--user-agent" "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1")
+                args+=("--concurrent-fragments" "4")
+                ;;
+              2)
+                args+=("--proxy" "socks5://127.0.0.1:1080")
+                args+=("--extractor-args" "youtube:player_client=web")
+                args+=("--js-runtimes" "deno")
+                args+=("--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                args+=("--add-header" "Accept-Language:en-US,en;q=0.9")
+                ;;
+              3)
+                args+=("--proxy" "socks5://127.0.0.1:1080")
+                args+=("--extractor-args" "youtube:player_client=mweb")
+                args+=("--concurrent-fragments" "4")
+                ;;
+              4)
+                args+=("--proxy" "socks5://127.0.0.1:1080")
+                args+=("--extractor-args" "youtube:player_client=android")
+                args+=("--user-agent" "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36")
+                args+=("--concurrent-fragments" "4")
+                ;;
+              5)
+                args+=("--proxy" "socks5://127.0.0.1:1080")
+                args+=("--extractor-args" "youtube:player_client=mweb,android,ios")
+                args+=("--concurrent-fragments" "4")
+                ;;
+              6)
+                args+=("--extractor-args" "youtube:player_client=ios")
+                args+=("--concurrent-fragments" "4")
+                ;;
+              7)
+                args+=("--extractor-args" "youtube:player_client=web")
+                args+=("--js-runtimes" "deno")
+                args+=("--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                args+=("--add-header" "Accept-Language:en-US,en;q=0.9")
+                ;;
+              8)
+                args+=("--extractor-args" "youtube:player_client=mweb")
+                args+=("--concurrent-fragments" "4")
+                ;;
+              9)
+                args+=("--extractor-args" "youtube:player_client=android")
+                args+=("--concurrent-fragments" "4")
+                ;;
+              10)
+                args+=("--proxy" "socks5://127.0.0.1:1080")
+                args+=("--extractor-args" "youtube:player_client=mweb,android,ios,android_vr")
+                args+=("--concurrent-fragments" "4")
+                ;;
+              *)
+                echo "Unknown method $meth"; exit 1 ;;
+            esac
+          }
 
           DOWNLOAD_SUCCESS=false
-          for idx in "${!METHOD_NAMES[@]}"; do
-            METHOD_NUM=$((idx+1))
-            echo "Trying method $METHOD_NUM/${#METHOD_NAMES[@]}..."
-            eval "method_args=(\"\${${METHOD_NAMES[$idx]}[@]}\")"
+          TOTAL_METHODS=10
+
+          for (( meth=1; meth<=TOTAL_METHODS; meth++ )); do
+            echo "Trying method $meth/$TOTAL_METHODS..."
+            get_method_args $meth
             set +e
-            yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} "${method_args[@]}" "$URL" 2>&1 | tee -a "$YT_LOG"
-            YT_EXIT_CODE=${PIPESTATUS[0]}
+            yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} "${args[@]}" "$URL" 2>&1 | tee -a "$YT_LOG"
+            YT_EXIT=${PIPESTATUS[0]}
             set -e
-            if [ $YT_EXIT_CODE -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
+            if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
               DOWNLOAD_SUCCESS=true
-              echo "Success with method $METHOD_NUM (exit=$YT_EXIT_CODE)"
+              echo "Success with method $meth (exit=$YT_EXIT)"
               break
             else
-              echo "Method $METHOD_NUM failed, waiting..."
+              echo "Method $meth failed, waiting..."
               sleep $((RANDOM % 10 + 5))
               find tmp_downloads -name "*.part" -delete 2>/dev/null || true
             fi
           done
 
+          # اگر هیچکدام موفق نبود، متد با کوکی امتحان شود
           if ! $DOWNLOAD_SUCCESS && [ "$COOKIES_STATUS" = "YES" ]; then
             echo "Trying final cookies method..."
             set +e
             yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} --extractor-args "youtube:player_client=web" "$URL" 2>&1 | tee -a "$YT_LOG"
-            YT_EXIT_CODE=${PIPESTATUS[0]}
+            YT_EXIT=${PIPESTATUS[0]}
             set -e
-            if [ $YT_EXIT_CODE -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
+            if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
               DOWNLOAD_SUCCESS=true
               echo "Success with cookies method"
             fi
