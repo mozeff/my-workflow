@@ -1,7 +1,7 @@
 🚧 **This repository is a work in progress.**  
 It is not yet complete and is actively being updated.
 
-This repository is a clone of projects from [nikzad-avasam](https://github.com/nikzad-avasam).  
+This repository draws inspiration from the projects of [nikzad-avasam](https://github.com/nikzad-avasam).  
 It was created with the sole purpose of helping my friends. This project has **no affiliation** with the original author and is **not intended for any unauthorized or illegal activity**.
 
 ## ⚠️ Disclaimer
