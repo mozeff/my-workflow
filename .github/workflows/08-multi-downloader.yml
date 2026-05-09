@@ -21,7 +21,7 @@ on:
         description: 'Add random extra delay (0-1s) to the wait time to avoid bot detection'
         required: false
         type: boolean
-        default: false
+        default: true
 
 jobs:
   browse:
