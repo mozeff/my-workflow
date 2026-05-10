@@ -47,11 +47,21 @@ on:
         required: false
         default: false
         type: boolean
-      # ⭐ ورودی جدید: حداکثر حجم هر پارت (مگابایت) برای split کردن فایل‌های بزرگ
       split_size:
         description: 'Max size per part (MB) – file will be split if larger (default 90)'
         required: false
         default: '90'
+        type: string
+      # ورودی‌های جدید برای پروکسی عمومی
+      use_public_proxy:
+        description: 'Use a tested working public SOCKS5 proxy as final fallback'
+        required: false
+        default: false
+        type: boolean
+      proxy_test_count:
+        description: 'Max proxies to test (number, or "all" to test the entire list) – used only if public proxy enabled'
+        required: false
+        default: '10'
         type: string
 
 jobs:
@@ -124,6 +134,65 @@ jobs:
             echo "Provider confirmed working."
           else
             echo "::warning::PO Token Provider might not be ready. Downloads may fail."
+          fi
+
+      - name: Find working public proxy
+        id: public_proxy
+        if: ${{ github.event.inputs.use_public_proxy == 'true' }}
+        run: |
+          PROXY_LIST_URL="https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt"
+          echo "Fetching proxy list from $PROXY_LIST_URL ..."
+          curl -sS --max-time 15 "$PROXY_LIST_URL" -o /tmp/socks5.txt
+          if [ ! -s /tmp/socks5.txt ]; then
+            echo "::warning::Failed to fetch proxy list. Public proxy fallback disabled."
+            echo "proxy_available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          mapfile -t PROXY_LIST < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$' /tmp/socks5.txt | shuf)
+
+          if [ ${#PROXY_LIST[@]} -eq 0 ]; then
+            echo "::warning::No valid proxies found in list."
+            echo "proxy_available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          TEST_COUNT_INPUT="${{ github.event.inputs.proxy_test_count }}"
+          MAX_TESTS=0
+          if [[ "$TEST_COUNT_INPUT" =~ ^[0-9]+$ ]]; then
+            MAX_TESTS=$((TEST_COUNT_INPUT))
+            [ $MAX_TESTS -le 0 ] && MAX_TESTS=10
+          elif [ "${TEST_COUNT_INPUT,,}" = "all" ]; then
+            MAX_TESTS=${#PROXY_LIST[@]}
+            echo "User chose to test all proxies (${MAX_TESTS} total)."
+          else
+            echo "::warning::Invalid proxy_test_count ('$TEST_COUNT_INPUT'), defaulting to 10."
+            MAX_TESTS=10
+          fi
+
+          echo "Testing up to $MAX_TESTS random proxies for YouTube accessibility..."
+          WORKING_PROXY=""
+          TESTED=0
+
+          for PROXY in "${PROXY_LIST[@]}"; do
+            [ $TESTED -ge $MAX_TESTS ] && break
+            TESTED=$((TESTED+1))
+            echo "  [$TESTED/$MAX_TESTS] Testing $PROXY ..."
+            if curl -sS --max-time 5 --socks5-hostname "$PROXY" -o /dev/null -w "%{http_code}" "https://www.youtube.com/" | grep -qE '^(200|301|302)$'; then
+              WORKING_PROXY="$PROXY"
+              echo "✅ Proxy $PROXY works!"
+              break
+            else
+              echo "❌ $PROXY failed or timed out."
+            fi
+          done
+
+          if [ -n "$WORKING_PROXY" ]; then
+            echo "proxy_available=true" >> $GITHUB_OUTPUT
+            echo "proxy_address=$WORKING_PROXY" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::No working proxy found after $TESTED attempts."
+            echo "proxy_available=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Install dependencies
@@ -216,8 +285,10 @@ jobs:
           YOUTUBE_COOKIES_SECRET="${{ secrets.YOUTUBE_COOKIES }}"
           STRICT="${{ github.event.inputs.strict_quality }}"
           USE_EXACT="${{ steps.quality_check.outputs.use_exact }}"
-          # ⭐ خواندن حجم پارت از ورودی جدید
           SPLIT_SIZE_INPUT="${{ github.event.inputs.split_size }}"
+          USE_PUBLIC_PROXY="${{ steps.public_proxy.outputs.proxy_available }}"
+          PUBLIC_PROXY="${{ steps.public_proxy.outputs.proxy_address }}"
+
           if ! [[ "$SPLIT_SIZE_INPUT" =~ ^[0-9]+$ ]] || [ "$SPLIT_SIZE_INPUT" -le 0 ]; then
             echo "Invalid split size, using default 90"
             SPLIT_SIZE_INPUT=90
@@ -293,6 +364,7 @@ jobs:
             fi
           fi
 
+          # ⭐ پرچم‌های معمولی (بدون thumbnail)
           COMMON_FLAGS=(--output "tmp_downloads/%(title)s.%(ext)s" --no-part --no-playlist --retries 10 --fragment-retries 10 --no-check-certificates)
 
           get_method_args() {
@@ -380,6 +452,28 @@ jobs:
             fi
           fi
 
+          # ⭐ آخرین راه حل: پروکسی عمومی
+          if ! $DOWNLOAD_SUCCESS && [ "$USE_PUBLIC_PROXY" = "true" ] && [ -n "$PUBLIC_PROXY" ]; then
+            echo "⚠️ WARP methods exhausted. Trying public proxy $PUBLIC_PROXY ..."
+            set +e
+            yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} \
+              --proxy "socks5://$PUBLIC_PROXY" \
+              --extractor-args "youtube:player_client=web,mweb;pot-provider=http://127.0.0.1:4416" \
+              --js-runtimes deno \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+              --add-header "Accept-Language:en-US,en;q=0.9" \
+              --concurrent-fragments 4 \
+              "$URL" 2>&1 | tee -a "$YT_LOG"
+            YT_EXIT=${PIPESTATUS[0]}
+            set -e
+            if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
+              DOWNLOAD_SUCCESS=true
+              echo "✅ Public proxy download succeeded!"
+            else
+              echo "❌ Public proxy also failed."
+            fi
+          fi
+
           if ! $DOWNLOAD_SUCCESS; then
             echo "All methods failed!"
             exit 1
@@ -456,6 +550,7 @@ jobs:
 
           for FILE in tmp_downloads/*; do
             [ -f "$FILE" ] || continue
+
             SIZE=$(stat -c%s "$FILE")
             BASENAME=$(basename "$FILE")
             FILENAME_NO_EXT="${BASENAME%.*}"
@@ -481,7 +576,6 @@ jobs:
               fi
             fi
 
-            # ⭐ استفاده از SPLIT_BYTES به جای عدد ثابت
             if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
               echo "Splitting $BASENAME into ${SPLIT_SIZE_INPUT}MB parts..."
               ARCHIVE_BASE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}"
@@ -530,7 +624,6 @@ jobs:
                 "4. All parts combine automatically" \
                 $( [ -n "$ZIP_PASSWORD" ] && echo "5. Enter the password when prompted" ) \
                 > "$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
-
             else
               [ -n "$ZIP_PASSWORD" ] && { 7z a -p"${ZIP_PASSWORD}" -mhe=on ${COMPRESS_FLAG} "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.7z" "$FILE"; ARCHIVE_EXT="7z"; } || { cp "$FILE" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${EXT}"; ARCHIVE_EXT="${EXT}"; }
               SIZE_MB=$(echo "scale=2; $SIZE/1048576" | bc)
@@ -573,6 +666,7 @@ jobs:
                 "${EXTRACT_GUIDE_LINE3}" \
                 > "$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
             fi
+            # دیگر thumbnail اضافه نمی‌شود.
           done
 
           rm -rf tmp_downloads

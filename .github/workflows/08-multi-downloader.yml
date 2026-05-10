@@ -60,6 +60,11 @@ on:
         required: false
         default: false
         type: boolean
+      screenshot_delay:
+        description: 'Delay before taking screenshot (seconds after page load)'
+        required: false
+        default: '0'
+        type: string
 
 jobs:
   save-file:
@@ -108,9 +113,15 @@ jobs:
           DOWNLOAD_IMAGES="${{ github.event.inputs.download_images }}"
           DELAY="${{ github.event.inputs.delay }}"
           ADD_JITTER="${{ github.event.inputs.add_jitter }}"
+          SCREENSHOT_DELAY="${{ github.event.inputs.screenshot_delay }}"
 
+          # Validate DELAY
           if ! [[ "$DELAY" =~ ^[0-9]+(\.[0-9]+)?$ ]] || [ "$(echo "$DELAY < 0" | bc)" -eq 1 ]; then
             DELAY=0
+          fi
+          # Validate SCREENSHOT_DELAY
+          if ! [[ "$SCREENSHOT_DELAY" =~ ^[0-9]+(\.[0-9]+)?$ ]] || [ "$(echo "$SCREENSHOT_DELAY < 0" | bc)" -eq 1 ]; then
+            SCREENSHOT_DELAY=0
           fi
           if ! [[ "$SPLIT_THRESHOLD_MB" =~ ^[0-9]+$ ]] || [ "$SPLIT_THRESHOLD_MB" -le 0 ]; then
             SPLIT_THRESHOLD_MB=45
@@ -203,6 +214,7 @@ jobs:
           const idx = process.argv[3];
           const doScreenshot = process.argv[4] === 'true';
           const doImages = process.argv[5] === 'true';
+          const screenshotDelaySec = parseFloat(process.argv[6] || '0');
 
           (async () => {
             const browser = await puppeteer.launch({
@@ -212,6 +224,13 @@ jobs:
             await page.setViewport({ width: 1280, height: 720 });
             try {
               await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+              // Wait additional user-defined seconds before capturing
+              if (screenshotDelaySec > 0) {
+                console.log(`Waiting ${screenshotDelaySec}s before screenshot...`);
+                await new Promise(resolve => setTimeout(resolve, screenshotDelaySec * 1000));
+              }
+
               if (doScreenshot) {
                 await page.screenshot({ path: `tmp_downloads/screenshot_${idx}.png`, fullPage: true });
               }
@@ -250,7 +269,7 @@ jobs:
 
             if [ "$TAKE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_IMAGES" = "true" ]; then
               echo "🌐 Scraping page #$idx/$TOTAL_URLS: $URL"
-              node scrape.js "$URL" "$idx" "$TAKE_SCREENSHOT" "$DOWNLOAD_IMAGES" || true
+              node scrape.js "$URL" "$idx" "$TAKE_SCREENSHOT" "$DOWNLOAD_IMAGES" "$SCREENSHOT_DELAY" || true
             fi
 
             FILENAME=$(basename "$URL" | sed 's/%20/ /g; s/%2F/-/g; s/[?#].*//' | sed 's/[<>:"|?*]/_/g')
@@ -287,11 +306,9 @@ jobs:
           mkdir -p "$FINAL_DIR"
           FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
 
-          # انتقال تمام فایل‌ها به پوشه نهایی
           mv tmp_downloads/* "$FINAL_DIR"/
           rmdir tmp_downloads
 
-          # محاسبه حجم کل فایل‌ها
           TOTAL_SIZE=0
           for f in "$FINAL_DIR"/*; do
             TOTAL_SIZE=$(( TOTAL_SIZE + $(stat -c%s "$f") ))
@@ -299,7 +316,6 @@ jobs:
           TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE/1048576" | bc)
 
           if [ "$MODE" = "none" ]; then
-            # بدون بسته‌بندی – فقط README با لینک مستقیم هر فایل
             {
               echo "# Downloaded files"
               echo ""
@@ -317,7 +333,6 @@ jobs:
             cd "$BACKUP_DIR"
             ZIP_NAME="${FOLDER_NAME}.zip"
 
-            # تصمیم‌گیری درباره اسپلیت
             DO_SPLIT=false
             if [ "$MODE" = "split" ] && [ "$TOTAL_SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
               DO_SPLIT=true
@@ -338,22 +353,18 @@ jobs:
               fi
             fi
 
-            # حذف پوشه اصلی (فقط ZIP/قطعات باقی بمانند)
             rm -rf "$FOLDER_NAME"
-            mkdir -p "$FINAL_DIR"   # دوباره ایجاد برای قرار دادن ZIP و README
+            mkdir -p "$FINAL_DIR"
 
             if [ "$DO_SPLIT" = true ]; then
-              # انتقال قطعات به پوشه
               for part in ${FOLDER_NAME}.z[0-9]* ${ZIP_NAME}; do
                 [ -f "$part" ] && mv "$part" "$FINAL_DIR/"
               done
-              # محاسبه حجم دقیق قطعات
               ARCHIVE_SIZE=0
               for part in "$FINAL_DIR"/*; do
                 ARCHIVE_SIZE=$(( ARCHIVE_SIZE + $(stat -c%s "$part") ))
               done
               ARCHIVE_MB=$(echo "scale=2; $ARCHIVE_SIZE/1048576" | bc)
-              # ساخت README
               {
                 echo "# Combined split archive"
                 echo ""
@@ -369,7 +380,6 @@ jobs:
                 echo "Download all parts and extract \`${ZIP_NAME}\` with 7-Zip/WinRAR."
               } > "$FINAL_DIR/README.md"
             else
-              # یک فایل ZIP ساده
               mv "${ZIP_NAME}" "$FINAL_DIR/"
               ZIP_SIZE=$(stat -c%s "$FINAL_DIR/$ZIP_NAME")
               ZIP_MB=$(echo "scale=2; $ZIP_SIZE/1048576" | bc)
@@ -411,7 +421,6 @@ jobs:
 
           FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
 
-          # یافتن حجم (ZIP یا قطعات)
           if [ -f "downloads/$FOLDER_NAME/${FOLDER_NAME}.zip" ]; then
             ARCHIVE_SIZE=$(stat -c%s "downloads/$FOLDER_NAME/${FOLDER_NAME}.zip")
           elif ls downloads/$FOLDER_NAME/*.z[0-9]* 1>/dev/null 2>&1; then
@@ -424,7 +433,6 @@ jobs:
           fi
           ARCHIVE_MB=$(echo "scale=2; $ARCHIVE_SIZE/1048576" | bc)
 
-          # بازسازی فهرست کلی (downloads/README.md)
           {
             echo "# Downloaded list :"
             echo ""
@@ -433,7 +441,6 @@ jobs:
             echo "---"
           } > downloads/README.md
 
-          # به‌روزرسانی README اصلی مخزن
           touch README.md
           sed -i '/^## Latest Downloads/,/^---$/d' README.md
           {
