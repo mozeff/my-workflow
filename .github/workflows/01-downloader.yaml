@@ -62,7 +62,6 @@ jobs:
           URLS="${{ github.event.inputs.urls }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
 
-          # دریافت حجم پارت از ورودی کاربر و اعتبارسنجی
           SPLIT_THRESHOLD_MB=${{ github.event.inputs.split_size }}
           if ! [[ "$SPLIT_THRESHOLD_MB" =~ ^[0-9]+$ ]] || [ "$SPLIT_THRESHOLD_MB" -le 0 ]; then
             echo "مقدار حجم پارت نامعتبر است. از مقدار پیش‌فرض 45 استفاده می‌شود."
@@ -91,7 +90,6 @@ jobs:
 
           # --- توابع جدید برای نام تصادفی عددی ---
           generate_random_numeric_name() {
-            # تولید یک عدد تصادفی بلند (حدود ۱۰-۱۲ رقم)
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
             echo "${PART1}${PART2}"
@@ -336,9 +334,9 @@ jobs:
 
                 cd tmp_downloads
                 if [ -n "$ZIP_PASSWORD" ]; then
-                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${BASENAME##*.}"
+                  zip -j -0 -s "${SPLIT_THRESHOLD_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${BASENAME##*.}"
                 else
-                  zip -0 -s "${SPLIT_THRESHOLD_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${BASENAME##*.}"
+                  zip -j -0 -s "${SPLIT_THRESHOLD_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${BASENAME##*.}"
                 fi
 
                 for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do

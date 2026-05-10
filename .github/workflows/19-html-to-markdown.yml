@@ -1,4 +1,4 @@
-name: 🔄 Convert HTML to Markdown (dynamic)
+name: 🔄 tool-Convert HTML to Markdown
 
 on:
   workflow_dispatch:
