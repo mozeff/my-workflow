@@ -50,6 +50,13 @@ on:
         required: false
         type: boolean
         default: false
+      # -------- گزینه جدید ذخیره‌سازی MHTML --------
+      save_mhtml:
+        description: 'Save each URL as a single MHTML file? (web pages only)'
+        required: false
+        type: boolean
+        default: false
+      # --------------------------------------------
       delay:
         description: 'Delay between each URL (seconds, can be decimal like 3)'
         required: false
@@ -63,7 +70,7 @@ on:
       screenshot_delay:
         description: 'Delay before taking screenshot (seconds after page load)'
         required: false
-        default: '0'
+        default: '2'
         type: string
 
 jobs:
@@ -94,7 +101,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 zip curl bc imagemagick
-          if [ "${{ github.event.inputs.take_screenshot }}" = "true" ] || [ "${{ github.event.inputs.download_images }}" = "true" ]; then
+          # شرط گسترش یافته تا اگر mhtml یا screenshot یا image دانلود خواسته شد، puppeteer نصب شود
+          if [ "${{ github.event.inputs.take_screenshot }}" = "true" ] || [ "${{ github.event.inputs.download_images }}" = "true" ] || [ "${{ github.event.inputs.save_mhtml }}" = "true" ]; then
             echo "Installing Node.js for scraping..."
             curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
             sudo apt-get install -y -qq nodejs
@@ -111,6 +119,9 @@ jobs:
           SPLIT_THRESHOLD_MB=${{ github.event.inputs.split_size }}
           TAKE_SCREENSHOT="${{ github.event.inputs.take_screenshot }}"
           DOWNLOAD_IMAGES="${{ github.event.inputs.download_images }}"
+          # -------- خواندن گزینه MHTML --------
+          SAVE_MHTML="${{ github.event.inputs.save_mhtml }}"
+          # ---------------------------------
           DELAY="${{ github.event.inputs.delay }}"
           ADD_JITTER="${{ github.event.inputs.add_jitter }}"
           SCREENSHOT_DELAY="${{ github.event.inputs.screenshot_delay }}"
@@ -206,7 +217,8 @@ jobs:
             fi
           }
 
-          if [ "$TAKE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_IMAGES" = "true" ]; then
+          # اسکریپت Node با دریافت پارامتر هفتم (saveMhtml)
+          if [ "$TAKE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_IMAGES" = "true" ] || [ "$SAVE_MHTML" = "true" ]; then
             cat > scrape.js << 'EOF'
           const puppeteer = require('puppeteer');
           const fs = require('fs');
@@ -215,6 +227,9 @@ jobs:
           const doScreenshot = process.argv[4] === 'true';
           const doImages = process.argv[5] === 'true';
           const screenshotDelaySec = parseFloat(process.argv[6] || '0');
+          // -------- دریافت آرگومان MHTML --------
+          const doMhtml = process.argv[7] === 'true';
+          // -----------------------------------
 
           (async () => {
             const browser = await puppeteer.launch({
@@ -225,15 +240,26 @@ jobs:
             try {
               await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-              // Wait additional user-defined seconds before capturing
+              // تاخیر اضافی پیش از ضبط
               if (screenshotDelaySec > 0) {
-                console.log(`Waiting ${screenshotDelaySec}s before screenshot...`);
+                console.log(`Waiting ${screenshotDelaySec}s before capture...`);
                 await new Promise(resolve => setTimeout(resolve, screenshotDelaySec * 1000));
               }
+
+              // -------- ذخیره MHTML (قبل از دانلود تصاویر) --------
+              if (doMhtml) {
+                console.log('Capturing MHTML snapshot...');
+                const cdp = await page.target().createCDPSession();
+                const { data } = await cdp.send('Page.captureSnapshot', { format: 'mhtml' });
+                fs.writeFileSync(`tmp_downloads/mhtml_${idx}.mhtml`, data);
+                console.log(`MHTML saved: tmp_downloads/mhtml_${idx}.mhtml`);
+              }
+              // -------------------------------------------------
 
               if (doScreenshot) {
                 await page.screenshot({ path: `tmp_downloads/screenshot_${idx}.png`, fullPage: true });
               }
+
               if (doImages) {
                 const imgUrls = await page.evaluate(() =>
                   Array.from(document.querySelectorAll('img'))
@@ -267,9 +293,10 @@ jobs:
           for URL in "${URL_ARRAY[@]}"; do
             idx=$((idx + 1))
 
-            if [ "$TAKE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_IMAGES" = "true" ]; then
+            # شرط اجرای scrape گسترده شد
+            if [ "$TAKE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_IMAGES" = "true" ] || [ "$SAVE_MHTML" = "true" ]; then
               echo "🌐 Scraping page #$idx/$TOTAL_URLS: $URL"
-              node scrape.js "$URL" "$idx" "$TAKE_SCREENSHOT" "$DOWNLOAD_IMAGES" "$SCREENSHOT_DELAY" || true
+              node scrape.js "$URL" "$idx" "$TAKE_SCREENSHOT" "$DOWNLOAD_IMAGES" "$SCREENSHOT_DELAY" "$SAVE_MHTML" || true
             fi
 
             FILENAME=$(basename "$URL" | sed 's/%20/ /g; s/%2F/-/g; s/[?#].*//' | sed 's/[<>:"|?*]/_/g')

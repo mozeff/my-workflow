@@ -1,0 +1,304 @@
+name: 🎬 new - Video Download or Link Extractor
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Select function'
+        required: true
+        type: choice
+        options:
+          - download
+          - extract_links
+        default: 'download'
+
+      url:
+        description: 'URL of the video (used in download mode)'
+        required: false
+        type: string
+        default: ''
+      output_folder:
+        description: 'Folder where the video will be saved (download mode)'
+        required: false
+        type: string
+        default: 'downloads'
+      quality:
+        description: 'Video quality selector for yt-dlp (download mode)'
+        required: false
+        type: string
+        default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
+      archive_name:
+        description: 'Base name for RAR archive (download mode, if split)'
+        required: false
+        type: string
+        default: 'video'
+
+      # --- Link extraction inputs ---
+      platform:
+        description: 'Choose platform for link extraction (only used in extract mode)'
+        required: false
+        type: choice
+        options:
+          - '***'
+          - '****'
+        default: '***'
+      tag_or_url:
+        description: 'URL or tag name for link extraction'
+        required: false
+        type: string
+        default: ''
+      num_links:
+        description: 'Number of video links to extract'
+        required: false
+        type: number
+        default: 10
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # optional, for compatibility
+
+jobs:
+  # ──────────────────── Download job ────────────────────
+  download:
+    if: github.event.inputs.mode == 'download'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install yt-dlp and bc
+        run: |
+          pip install -U yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y bc
+
+      - name: Download video (retry up to 5 times)
+        id: download
+        shell: bash
+        run: |
+          FOLDER="${{ github.event.inputs.output_folder }}"
+          mkdir -p "$FOLDER"
+          touch marker
+
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
+
+            yt-dlp \
+              --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+              --format "${{ github.event.inputs.quality }}" \
+              --merge-output-format mp4 \
+              --retries 3 \
+              --fragment-retries 10 \
+              --no-check-certificate \
+              --geo-bypass \
+              --no-color \
+              --ignore-errors \
+              --newline \
+              "${{ github.event.inputs.url }}" && {
+
+                NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
+
+                if [ -n "$NEW_FILE" ]; then
+                  echo "Download succeeded: $NEW_FILE"
+                  SUCCESS=true
+                  break
+                else
+                  echo "Download finished but no file detected. Retrying..."
+                fi
+              } || {
+                echo "Download attempt failed"
+              }
+
+            RETRY_COUNT=$((RETRY_COUNT+1))
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              sleep 5
+            fi
+          done
+
+          if [ "$SUCCESS" = false ]; then
+            echo "All download attempts failed"
+            exit 1
+          fi
+
+          FILENAME=$(basename "$NEW_FILE")
+          SIZE_BYTES=$(stat -c %s "$NEW_FILE")
+
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+          echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
+
+      - name: Install RAR
+        run: sudo apt-get install -y rar
+
+      - name: Conditional split (if file > 99 MB)
+        id: split
+        shell: bash
+        run: |
+          FOLDER="${{ github.event.inputs.output_folder }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
+          SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
+          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
+          THRESHOLD_MB=99
+
+          cd "$FOLDER"
+
+          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
+
+            RANDOM_HEX=$(openssl rand -hex 3)
+            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
+
+            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
+
+            rm "$FILENAME"
+
+            echo "split_done=true" >> $GITHUB_OUTPUT
+            ls -lh "${ARCHIVE_NAME}.part"*.rar
+
+          else
+            echo "split_done=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push to repository
+        shell: bash
+        run: |
+          FOLDER="${{ github.event.inputs.output_folder }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "$FOLDER/"
+
+          git commit -m "Add downloaded video(s)" || echo "Nothing to commit"
+
+          git push
+
+  # ──────────────────── Link extraction job ────────────────────
+  extract:
+    if: github.event.inputs.mode == 'extract_links'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install yt-dlp
+        run: pip install -U yt-dlp
+
+      - name: Extract links from selected platform
+        run: |
+          INPUT="${{ github.event.inputs.tag_or_url }}"
+          NUM_LINKS="${{ github.event.inputs.num_links }}"
+          PLATFORM="${{ github.event.inputs.platform }}"
+
+          # Construct target URL based on platform
+          if [[ "$INPUT" =~ ^https?:// ]]; then
+            TARGET_URL="$INPUT"
+          else
+            TAG=$(echo "$INPUT" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+            case "$PLATFORM" in
+              "***")
+                TARGET_URL="https://www.***.com/gifs/tag/${TAG}"
+                ;;
+              "****")
+                # Adjust the following URL pattern to match the platform ****
+                TARGET_URL="https://www.****.com/tag/${TAG}"
+                ;;
+              *)
+                echo "Unknown platform: $PLATFORM"
+                exit 1
+                ;;
+            esac
+          fi
+
+          echo "Platform: $PLATFORM"
+          echo "Target URL: ${TARGET_URL}"
+          echo "Extracting up to ${NUM_LINKS} links..."
+
+          # Temporary file to collect valid URLs
+          TMP_LINKS="/tmp/tmp_links.txt"
+          > "$TMP_LINKS"
+
+          while IFS='|' read -r USERNAME TITLE URL; do
+            if [ -n "$TITLE" ] && [ -n "$URL" ]; then
+              echo "$URL" >> "$TMP_LINKS"
+            fi
+          done < <(yt-dlp --flat-playlist --playlist-end "$NUM_LINKS" \
+                     --print "%(uploader)s|%(title)s|%(webpage_url)s" \
+                     "$TARGET_URL" 2>/dev/null || echo "Failed to extract.")
+
+          TOTAL=$(wc -l < "$TMP_LINKS")
+          echo "Successfully extracted $TOTAL links."
+
+          # Create summary without details
+          LINKS_FILE="/tmp/extracted_links.md"
+          {
+            echo "# Extracted Links Summary"
+            echo ""
+            echo "Platform: **${PLATFORM}**"
+            echo "Total links extracted: **${TOTAL}**"
+            echo ""
+            echo "*Generated by GitHub Actions*"
+          } > "$LINKS_FILE"
+
+          cat "$LINKS_FILE"
+
+          mkdir -p lists
+          cp "$LINKS_FILE" lists/extracted_links.md
+
+      - name: Commit and push list to repository
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          BRANCH="${GITHUB_REF_NAME}"
+
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
+
+          mkdir -p lists
+          cp /tmp/extracted_links.md lists/extracted_links.md
+
+          git add lists/extracted_links.md
+
+          if git diff --cached --quiet; then
+            echo "No changes to push."
+            exit 0
+          fi
+
+          git commit -m "[Link Extraction] Updated list for ${PLATFORM} [skip ci]"
+
+          RETRY_MAX=10
+          for ((i=1; i<=RETRY_MAX; i++)); do
+            echo "Push attempt $i/$RETRY_MAX"
+            if git push origin HEAD:"$BRANCH" 2>&1; then
+              echo "Push successful!"
+              exit 0
+            else
+              WAIT=$((2 + RANDOM % 8))
+              echo "Push failed, retrying in ${WAIT}s..."
+              sleep $WAIT
+            fi
+          done
+
+          echo "All push attempts failed."
+          exit 1

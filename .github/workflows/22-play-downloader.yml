@@ -1,0 +1,320 @@
+name: ▶️ new - play downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Package name (e.g., com.google.android.youtube)'
+        required: true
+        type: string
+      architecture:
+        description: 'Target architecture'
+        required: true
+        type: choice
+        default: 'arm64'
+        options:
+          - arm64
+          - armv7
+          - x86
+          - x86_64
+      merge_splits:
+        description: 'Merge split APKs into single installable APK'
+        required: false
+        type: boolean
+        default: true
+      output_folder:
+        description: 'Output folder (relative to repo root)'
+        required: false
+        type: string
+        default: 'downloads'
+      password:
+        description: 'Password for 7z archive (optional)'
+        required: false
+        default: ''
+        type: string
+      split_size:
+        description: 'Max part size in MB (>100MB may require Git LFS to push)'
+        required: false
+        default: '85'
+        type: string
+
+jobs:
+  download-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Create output folder
+        run: mkdir -p "${{ inputs.output_folder }}"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openjdk-17-jre-headless apksigner python3 python3-venv python3-pip curl git p7zip-full
+
+      - name: Clone gplay-apk-downloader
+        run: |
+          git clone https://github.com/alltechdev/gplay-apk-downloader.git
+          cd gplay-apk-downloader
+          ./setup.sh
+
+      - name: Authenticate with Play
+        run: |
+          cd gplay-apk-downloader
+          echo "y" | ./gplay auth || echo "⚠️ Authentication step finished (may need manual credentials if first run)"
+          echo "Authentication completed."
+
+      - name: Download APK
+        id: download
+        run: |
+          cd gplay-apk-downloader
+          ARCH="${{ inputs.architecture }}"
+          MERGE="${{ inputs.merge_splits }}"
+          OUTPUT_DIR="../${{ inputs.output_folder }}"
+          
+          CMD="./gplay download ${{ inputs.package_name }} -a $ARCH -o $OUTPUT_DIR"
+          if [ "$MERGE" = "true" ]; then
+            CMD="$CMD -m"
+          fi
+          
+          echo "Running: $CMD"
+          $CMD
+          
+          # Identify downloaded file(s)
+          cd "$OUTPUT_DIR"
+          if [ "$MERGE" = "true" ]; then
+            DOWNLOADED_FILE=$(ls -1 *.apk 2>/dev/null | head -n1)
+          else
+            DOWNLOADED_FILE=$(ls -1 *.apk *.zip 2>/dev/null | head -n1)
+          fi
+          
+          if [ -z "$DOWNLOADED_FILE" ]; then
+            echo "Error: No file downloaded"
+            exit 1
+          fi
+          
+          echo "downloaded_file_path=$OUTPUT_DIR/$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
+          echo "downloaded_file_name=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
+
+      - name: Package APK (compress, split, optional password)
+        id: package
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess, shutil, glob, json
+
+          OUTPUT_DIR = "${{ inputs.output_folder }}"
+          DOWNLOADED_FILE = "${{ steps.download.outputs.downloaded_file_name }}"
+          PACKAGE_NAME = "${{ inputs.package_name }}"
+          ARCH = "${{ inputs.architecture }}"
+          MERGE = "${{ inputs.merge_splits }}" == "true"
+          PASSWORD = """${{ inputs.password }}"""
+          SPLIT_SIZE_MB = int("""${{ inputs.split_size }}""" or 85)
+
+          file_path = os.path.join(OUTPUT_DIR, DOWNLOADED_FILE)
+          if not os.path.exists(file_path):
+              print("Downloaded file not found")
+              exit(1)
+
+          # Determine base name for archive
+          if MERGE:
+              archive_base = f"{PACKAGE_NAME}_{ARCH}_merged"
+          else:
+              archive_base = f"{PACKAGE_NAME}_{ARCH}_splits"
+
+          os.chdir(OUTPUT_DIR)
+
+          already_compressed = os.path.splitext(DOWNLOADED_FILE)[1].lower() in {
+              '.zip', '.rar', '.7z', '.gz', '.bz2', '.xz', '.tar', '.tgz'
+          }
+
+          parts_info = []
+          def add_part(name, sz):
+              parts_info.append({"name": name, "size_mb": round(sz/1048576, 2)})
+
+          if already_compressed:
+              print("📦 APK is already compressed (zip) – will split without re-compression")
+              fsize = os.path.getsize(DOWNLOADED_FILE)
+              if fsize > SPLIT_SIZE_MB * 1048576:
+                  subprocess.run(['split', '-b', f'{SPLIT_SIZE_MB}m', '-d',
+                                  '--additional-suffix=.apk_part', DOWNLOADED_FILE,
+                                  f'{archive_base}_part.'], check=True)
+                  os.remove(DOWNLOADED_FILE)
+                  for p in sorted(glob.glob(f'{archive_base}_part.[0-9]*.apk_part')):
+                      add_part(p, os.path.getsize(p))
+                  with open('reassemble.sh', 'w') as f:
+                      f.write(f"#!/bin/bash\ncat {archive_base}_part.*.apk_part > {DOWNLOADED_FILE}\necho Reassembled: {DOWNLOADED_FILE}\n")
+              else:
+                  add_part(DOWNLOADED_FILE, fsize)
+          else:
+              # Compress with 7z (though APK is already zip, but might not be merged yet)
+              archive = f'{archive_base}.7z'
+              cmd = ['7z', 'a', '-mx=3']
+              if PASSWORD:
+                  cmd.extend([f'-p{PASSWORD}', '-mhe=on'])
+              if os.path.getsize(file_path) > SPLIT_SIZE_MB * 1048576:
+                  cmd.append(f'-v{SPLIT_SIZE_MB}m')
+              cmd.extend([archive, DOWNLOADED_FILE])
+              subprocess.run(cmd, check=True)
+              os.remove(file_path)
+              for p in sorted(glob.glob(f'{archive_base}.7z.*')):
+                  add_part(p, os.path.getsize(p))
+              if not parts_info:
+                  add_part(archive, os.path.getsize(archive))
+
+          os.chdir('../..')  # back to repo root
+
+          with open('/tmp/package_result.json', 'w') as f:
+              json.dump({
+                  "output_dir": OUTPUT_DIR,
+                  "original_file": DOWNLOADED_FILE,
+                  "package_name": PACKAGE_NAME,
+                  "arch": ARCH,
+                  "parts": parts_info,
+                  "password": bool(PASSWORD)
+              }, f)
+
+          print("✅ Packaging complete")
+          PYEOF
+
+      - name: Generate README & Links.md
+        run: |
+          python3 << 'PYEOF'
+          import json, os, datetime
+          from urllib.parse import quote
+
+          if not os.path.exists('/tmp/package_result.json'):
+              print("No package result, skipping documentation")
+              exit(0)
+
+          with open('/tmp/package_result.json') as f:
+              pkg = json.load(f)
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          branch = os.environ['GITHUB_REF_NAME']
+          output_dir = pkg['output_dir']
+          original = pkg['original_file']
+          package = pkg['package_name']
+          arch = pkg['arch']
+          parts = pkg['parts']
+          has_password = pkg['password']
+          now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+          raw_base = f"https://github.com/{repo}/raw/refs/heads/{branch}/{output_dir}"
+
+          # README inside output folder
+          lines = [f"# 📱 {package}\n"]
+          lines.append(f"**Downloaded:** {now}  \n")
+          lines.append(f"**Architecture:** {arch}  \n")
+          lines.append("---\n")
+          lines.append("## 📊 Status\n")
+          lines.append("| Property | Value |")
+          lines.append("|----------|-------|")
+          lines.append("| **Status** | ✅ Downloaded |")
+          lines.append(f"| **Package** | `{package}` |")
+          lines.append(f"| **Parts** | {len(parts)} |")
+          if has_password:
+              lines.append("| **Password** | yes |")
+          lines.append("---\n")
+          lines.append("## 📥 Download Links\n")
+          if any('.7z.' in p['name'] for p in parts):
+              lines.append(f"Split into **{len(parts)} part(s)** (7z archive)\n")
+              lines.append("| # | File | Size | Download |")
+              lines.append("|---|------|------|----------|")
+              for i, p in enumerate(parts, 1):
+                  lines.append(f"| {i} | `{p['name']}` | {p['size_mb']} MB | [⬇️]({raw_base}/{quote(p['name'], safe='')}) |")
+              lines.append("\n**Extract:** open `.7z.001` with 7-Zip")
+          elif any('.apk_part' in p['name'] for p in parts):
+              lines.append(f"Split into **{len(parts)} part(s)** (uncompressed APK)\n")
+              lines.append("| # | File | Size | Download |")
+              lines.append("|---|------|------|----------|")
+              for i, p in enumerate(parts, 1):
+                  lines.append(f"| {i} | `{p['name']}` | {p['size_mb']} MB | [⬇️]({raw_base}/{quote(p['name'], safe='')}) |")
+              lines.append(f"\n**Reassemble:** `cat *.apk_part > {original}`")
+          else:
+              p = parts[0]
+              lines.append(f"| File | Size | Download |")
+              lines.append(f"|------|------|----------|")
+              lines.append(f"| `{p['name']}` | {p['size_mb']} MB | [⬇️ Download]({raw_base}/{quote(p['name'], safe='')}) |")
+          lines.append("")
+          lines.append(f"*Generated by GitHub Actions*")
+
+          os.makedirs(output_dir, exist_ok=True)
+          readme_path = os.path.join(output_dir, 'README.md')
+          with open(readme_path, 'w') as f:
+              f.write('\n'.join(lines))
+
+          # Links.md at root
+          links_md = [f"# 📥 Play Download\n"]
+          links_md.append(f"**{now}**\n\n")
+          links_md.append(f"### {package} ({arch})\n")
+          links_md.append(f"| Property | Value |")
+          links_md.append(f"|----------|-------|")
+          links_md.append(f"| **Status** | ✅ Downloaded |")
+          links_md.append(f"| **Folder** | `{output_dir}` |")
+          links_md.append(f"| **Parts** | {len(parts)} |")
+          links_md.append("")
+          for p in parts:
+              links_md.append(f"- [{p['name']}]({raw_base}/{quote(p['name'], safe='')}) ({p['size_mb']} MB)")
+          links_md.append("\n---")
+          with open('Links.md', 'w') as f:
+              f.write('\n'.join(links_md))
+
+          print("✅ README & Links.md generated")
+          PYEOF
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: Clean up original download (keep archives only)
+        run: |
+          if [ -f "${{ steps.download.outputs.downloaded_file_path }}" ]; then
+            rm "${{ steps.download.outputs.downloaded_file_path }}"
+          fi
+
+      - name: Commit and push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ inputs.output_folder }}/" Links.md
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "📦 Download ${{ inputs.package_name }} (${{ inputs.architecture }}) from Play [skip ci]" || true
+
+          for i in 1 2 3 4 5; do
+            if timeout 120 git push origin HEAD:"$BRANCH"; then
+              echo "✅ Push successful"
+              exit 0
+            fi
+            echo "⚠️ Push failed, retrying after pull..."
+            git pull --rebase origin "$BRANCH" || git pull origin "$BRANCH"
+            sleep $((2+RANDOM%5))
+            git add "${{ inputs.output_folder }}/" Links.md
+            git commit -m "📦 Download ${{ inputs.package_name }} (${{ inputs.architecture }}) from Play [skip ci]" || true
+          done
+          echo "❌ Push failed after 5 attempts"
+          exit 1
+
+      - name: Final report
+        if: always()
+        run: |
+          if [ -f "/tmp/package_result.json" ]; then
+            FOLDER=$(python3 -c "import json; print(json.load(open('/tmp/package_result.json'))['output_dir'])")
+            echo "📁 Folder: $FOLDER"
+          else
+            echo "❌ Download did not complete successfully"
+          fi
+          if [ -f "Links.md" ]; then
+            head -20 Links.md
+          fi

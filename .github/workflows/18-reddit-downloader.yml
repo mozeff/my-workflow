@@ -57,7 +57,6 @@ on:
         required: false
         default: '90'
         type: string
-      # ----------------------------------
 
 jobs:
   download:
@@ -67,7 +66,6 @@ jobs:
       contents: write
 
     steps:
-      # Step 0: Checkout only if push_to_repo is true (otherwise we don't need repo)
       - name: 🧰 Checkout repository (for push)
         if: ${{ github.event.inputs.push_to_repo == 'true' }}
         uses: actions/checkout@v4
@@ -88,7 +86,7 @@ jobs:
           git config user.email "github-actions@github.com"
           echo "Git configured for large file handling"
 
-      # Step 1: Get OAuth2 token from Reddit (unchanged)
+      # ⚠️ بخش اصلاح‌شده: دریافت توکن با بررسی کد وضعیت HTTP و جلوگیری از خطای jq
       - name: 🔑 Get Reddit Access Token
         id: auth
         env:
@@ -97,13 +95,26 @@ jobs:
         run: |
           if [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ]; then
             echo "🟢 Using OAuth2"
-            RESPONSE=$(curl -s -X POST -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
               -u "$CLIENT_ID:$CLIENT_SECRET" \
               -d "grant_type=client_credentials" \
               https://www.reddit.com/api/v1/access_token)
-            TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
-            if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
-              echo "❌ Failed to obtain token: $RESPONSE"
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            
+            echo "HTTP status: $HTTP_CODE"
+            
+            if [ "$HTTP_CODE" -ne 200 ]; then
+              echo "❌ Token request failed (HTTP $HTTP_CODE). Response:"
+              echo "$BODY"
+              exit 1
+            fi
+            
+            TOKEN=$(echo "$BODY" | jq -r '.access_token')
+            if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+              echo "❌ Token not found in response: $BODY"
               exit 1
             fi
             echo "ACCESS_TOKEN=$TOKEN" >> $GITHUB_ENV
@@ -112,7 +123,6 @@ jobs:
             echo "ACCESS_TOKEN=" >> $GITHUB_ENV
           fi
 
-      # Step 2: Fetch Posts (unchanged)
       - name: 📥 Fetch Posts
         id: fetch
         run: |
@@ -143,9 +153,8 @@ jobs:
           jq ".[$SKIP:$((SKIP+LIMIT))]" media_posts.json > posts.json
           echo "📄 Final post count: $(jq length posts.json)"
 
-      # Step 3: Save Text and Links (unchanged)
       - name: 📝 Save Text and Links
-        if: ${{ github.event.inputs.include_text == true || github.event.inputs.include_link == true }}
+        if: ${{ github.event.inputs.include_text == 'true' || github.event.inputs.include_link == 'true' }}
         run: |
           jq -r '.[] |
             "---\nTitle: \(.title)\n" +
@@ -153,11 +162,9 @@ jobs:
             (if "'${{ github.event.inputs.include_link }}'" == "true" then "Link: https://www.reddit.com\(.permalink)\n" else "" end) +
             "---"' posts.json > posts_summary.txt
 
-      # Step 4: Install tools (add imagemagick if needed for resize)
       - name: 🛠️ Install Multimedia Tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg imagemagick zip
 
-      # Step 5: Extract and Download (unchanged)
       - name: 🖼️ Extract and Download Media Files
         run: |
           mkdir -p downloads
@@ -179,7 +186,6 @@ jobs:
           done
           echo "✅ Download finished. Files: $(ls downloads | wc -l)"
 
-      # Step 6: Resize (unchanged)
       - name: 🔄 Resize Media (Optional)
         if: ${{ github.event.inputs.max_height != '0' && github.event.inputs.max_height != '' }}
         run: |
@@ -210,7 +216,6 @@ jobs:
           done
           echo "✅ Resizing complete."
 
-      # Step 7: Create initial ZIP (no split yet)
       - name: 📦 Create ZIP Archive
         id: zip
         run: |
@@ -232,7 +237,7 @@ jobs:
           echo "ZIP_PATH=$(pwd)/$ZIP_NAME" >> $GITHUB_ENV
           echo "✅ ZIP archive created: $ZIP_NAME"
 
-      # -------- بخش جدید: Split و Push به ریپازیتوری ----------
+      # -------- Split & Push به ریپازیتوری (همراه با README) ----------
       - name: 📤 Split & Push to Repository (if enabled)
         if: ${{ github.event.inputs.push_to_repo == 'true' && success() }}
         run: |
@@ -247,7 +252,6 @@ jobs:
           REPO_NAME="${{ github.event.repository.name }}"
           BRANCH="${GITHUB_REF_NAME}"
 
-          # تابع تولید نام عددی تصادفی (مشابه دانلودر قبلی)
           generate_random_numeric_name() {
             local PART1=$(( RANDOM * 32768 + RANDOM ))
             local PART2=$(( RANDOM * 32768 + RANDOM ))
@@ -269,13 +273,11 @@ jobs:
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
 
-          # پوشه مقصد
           mkdir -p downloads_reddit
           ZIP_PATH="${{ env.ZIP_PATH }}"
           ZIP_NAME="${{ env.ZIP_FILE }}"
           ZIP_SIZE=$(stat -c%s "$ZIP_PATH")
 
-          # ساخت پوشه با نام عددی
           FOLDER_NAME=$(get_unique_numeric_folder)
           DEST_DIR="downloads_reddit/$FOLDER_NAME"
           mkdir -p "$DEST_DIR"
@@ -283,9 +285,7 @@ jobs:
           if [ "$ZIP_SIZE" -gt "$SPLIT_BYTES" ]; then
             echo "⚡ ZIP size ($(echo "scale=2; $ZIP_SIZE/1024/1024" | bc) MB) exceeds ${SPLIT_MB}MB - splitting"
             cd "$(dirname "$ZIP_PATH")"
-            # split zip with zero compression (store)
             zip -0 -s "${SPLIT_MB}m" "${FOLDER_NAME}.zip" "$ZIP_NAME"
-            # move all parts (including original zip, but it's removed by split)
             for part in ${FOLDER_NAME}.z[0-9]* ${FOLDER_NAME}.zip; do
               if [ -f "$part" ]; then
                 mv "$part" "$OLDPWD/$DEST_DIR/"
@@ -297,7 +297,6 @@ jobs:
             cp "$ZIP_PATH" "$DEST_DIR/${FOLDER_NAME}.zip"
           fi
 
-          # ساخت README در پوشه
           PARTS_COUNT=$(ls "$DEST_DIR" | wc -l)
           FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
           REPO_BASE="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads_reddit/${FOLDER_ENCODED}"
@@ -317,14 +316,9 @@ jobs:
             echo "> To extract, download all parts and open the .zip file."
           } > "$DEST_DIR/README.md"
 
-          # Push (incremental like previous workflow)
           echo "🔃 Pushing to repository..."
-
-          # اینجا یک push ساده برای تعداد کم فایل انجام می‌دهیم
-          # چون قبلاً ریپو checkout شده است
           git add downloads_reddit/
           git diff --cached --quiet || git commit -m "[Reddit] Add $FOLDER_NAME [skip ci]"
-          # try push with retry
           for i in 1 2 3; do
             if git pull --rebase origin "$BRANCH" && git push origin HEAD:"$BRANCH"; then
               echo "✅ Push successful"
@@ -337,7 +331,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Step 8: Upload Artifact (always done, even if push also happens)
       - name: 📤 Upload Artifact
         uses: actions/upload-artifact@v4
         with:
