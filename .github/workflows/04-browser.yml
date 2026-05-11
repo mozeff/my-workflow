@@ -22,6 +22,13 @@ on:
         required: false
         type: boolean
         default: true
+      # ───── گزینه جدید ذخیره‌سازی MHTML ─────
+      save_mhtml:
+        description: 'Save the page as a single MHTML file?'
+        required: false
+        type: boolean
+        default: false
+      # ─────────────────────────────────────
       split_size:
         description: 'Max size per part (MB) – 0 or empty = no split (default 90)'
         required: false
@@ -44,13 +51,14 @@ jobs:
           sudo apt-get install -y -qq curl zip imagemagick
 
       - name: Setup Node.js and Puppeteer
-        if: ${{ github.event.inputs.include_screenshot == 'true' || github.event.inputs.download_media == 'true' }}
+        # شرط گسترش یافته برای MHTML
+        if: ${{ github.event.inputs.include_screenshot == 'true' || github.event.inputs.download_media == 'true' || github.event.inputs.save_mhtml == 'true' }}
         run: |
           npm init -y > /dev/null
           npm install puppeteer > /dev/null
 
       - name: Create screenshot & HTML extractor script
-        if: ${{ github.event.inputs.include_screenshot == 'true' || github.event.inputs.download_media == 'true' }}
+        if: ${{ github.event.inputs.include_screenshot == 'true' || github.event.inputs.download_media == 'true' || github.event.inputs.save_mhtml == 'true' }}
         run: |
           cat > screenshot.js << 'EOF'
           const puppeteer = require('puppeteer');
@@ -59,6 +67,9 @@ jobs:
           const screenshotPath = process.argv[3];
           const htmlPath = process.argv[4];
           const doScreenshot = process.argv[5] === 'true';
+          // آرگومان‌های جدید MHTML
+          const doMhtml = process.argv[6] === 'true';
+          const mhtmlPath = process.argv[7];
 
           (async () => {
             const browser = await puppeteer.launch({
@@ -71,6 +82,7 @@ jobs:
             try {
               await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
+              // اسکرول به‌منظور بارگذاری کامل محتوا
               await page.evaluate(async () => {
                 await new Promise((resolve) => {
                   let totalHeight = 0;
@@ -86,6 +98,16 @@ jobs:
                 });
               });
               await page.waitForTimeout(2000);
+
+              // ───── ضبط MHTML (قبل از اسکرین‌شات) ─────
+              if (doMhtml && mhtmlPath) {
+                console.log('Capturing MHTML...');
+                const cdp = await page.target().createCDPSession();
+                const { data } = await cdp.send('Page.captureSnapshot', { format: 'mhtml' });
+                fs.writeFileSync(mhtmlPath, data);
+                console.log('MHTML saved successfully');
+              }
+              // ────────────────────────────────────────
 
               if (doScreenshot) {
                 await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -111,6 +133,7 @@ jobs:
           RAW_URL="${{ github.event.inputs.url }}"
           INCLUDE_SCREENSHOT="${{ github.event.inputs.include_screenshot }}"
           DOWNLOAD_MEDIA="${{ github.event.inputs.download_media }}"
+          SAVE_MHTML="${{ github.event.inputs.save_mhtml }}"
 
           if [[ ! "$RAW_URL" =~ ^https?:// ]]; then
             HTTPS_URL="https://$RAW_URL"
@@ -151,18 +174,19 @@ jobs:
           HTML_OK=false
 
           NEED_PUPPETEER=false
-          if [ "$INCLUDE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_MEDIA" = "true" ]; then
+          if [ "$INCLUDE_SCREENSHOT" = "true" ] || [ "$DOWNLOAD_MEDIA" = "true" ] || [ "$SAVE_MHTML" = "true" ]; then
             NEED_PUPPETEER=true
           fi
 
           if $NEED_PUPPETEER; then
-            echo "Running Puppeteer (screenshot=$INCLUDE_SCREENSHOT, media=$DOWNLOAD_MEDIA)..."
-            if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html" "$INCLUDE_SCREENSHOT"; then
+            echo "Running Puppeteer (screenshot=$INCLUDE_SCREENSHOT, media=$DOWNLOAD_MEDIA, mhtml=$SAVE_MHTML)..."
+            # اجرای اسکریپت با آرگومان‌های MHTML
+            if node screenshot.js "$URL" "$FOLDER/screenshot.png" "$FOLDER/page.html" "$INCLUDE_SCREENSHOT" "$SAVE_MHTML" "$FOLDER/page.mhtml"; then
               HTML_OK=true
               if [ "$INCLUDE_SCREENSHOT" = "true" ]; then
                 SCREENSHOT_OK=true
               fi
-              echo "Puppeteer succeeded: HTML saved. Screenshot: $SCREENSHOT_OK"
+              echo "Puppeteer succeeded: HTML saved. Screenshot: $SCREENSHOT_OK. MHTML: $SAVE_MHTML"
             else
               echo "Puppeteer failed. Falling back to curl for raw HTML."
               curl -sSL -A "Mozilla/5.0" -o "$FOLDER/page.html" "$URL" || {
@@ -236,7 +260,7 @@ jobs:
             echo "" > "$FOLDER/downloaded_media.md"
           fi
 
-          # ساخت index.md داخل پوشه (درون ZIP باقی می‌ماند، اما برای browse.md مهم نیست)
+          # ساخت index.md داخل پوشه (درون ZIP باقی می‌ماند)
           {
             echo "# Downloaded page"
             echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -248,6 +272,9 @@ jobs:
             fi
             echo "## HTML Source"
             echo "[page.html](./page.html)  ($(wc -c < "$FOLDER/page.html") bytes)"
+            if [ "$SAVE_MHTML" = "true" ] && [ -f "$FOLDER/page.mhtml" ]; then
+              echo "[page.mhtml](./page.mhtml)  ($(wc -c < "$FOLDER/page.mhtml") bytes)"
+            fi
             echo ""
             if [ "$DOWNLOAD_MEDIA" = "true" ]; then
               echo "## Downloaded Media ($MEDIA_COUNT files)"
@@ -270,7 +297,6 @@ jobs:
             echo "- Media downloaded: $MEDIA_COUNT"
           } > "$FOLDER/index.md"
 
-          # دیگر browse.md را به‌روز نمی‌کنیم – این کار پس از بسته‌بندی انجام می‌شود
           echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
           echo "DATE_UTC=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
           echo "Session complete."
@@ -309,7 +335,6 @@ jobs:
               zip -s ${SPLIT_SIZE_MB}m -r "${ZIP_NAME}" "$FOLDER_NAME"
             fi
             PARTS=$(ls ${FOLDER_NAME}.z[0-9]* ${ZIP_NAME} 2>/dev/null | sort)
-            # محاسبه حجم کل قطعات
             TOTAL_ARCHIVE_SIZE=0
             for part in $PARTS; do
               TOTAL_ARCHIVE_SIZE=$((TOTAL_ARCHIVE_SIZE + $(stat -c%s "$part")))
@@ -334,7 +359,6 @@ jobs:
           BRANCH="${GITHUB_REF_NAME}"
           BASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${BRANCH}/pages"
 
-          # تولید صفحهٔ جلسه (pages/FOLDER_NAME.md) با فقط حجم و لینک دانلود
           {
             echo "# Downloaded page"
             echo ""
@@ -370,7 +394,6 @@ jobs:
             echo "*Generated by GitHub Actions*"
           } > "${FOLDER_NAME}.md"
 
-          # به‌روزرسانی browse.md با فقط حجم
           BROWSE_FILE="../browse.md"
           if [[ ! -f "$BROWSE_FILE" ]]; then
             echo "# Browsed Websites" > "$BROWSE_FILE"
