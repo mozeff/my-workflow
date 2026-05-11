@@ -63,7 +63,7 @@ on:
       screenshot_delay:
         description: 'Delay before taking screenshot (seconds after page load)'
         required: false
-        default: '0'
+        default: '2'
         type: string
 
 jobs:
