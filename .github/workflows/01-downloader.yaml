@@ -21,9 +21,9 @@ on:
         default: ''
         type: string
       split_size:
-        description: 'حداکثر حجم هر پارت (مگابایت) - پیش‌فرض ۴۵'
+        description: 'حداکثر حجم هر پارت (مگابایت) - پیش‌فرض 90'
         required: false
-        default: '45'
+        default: '90'
         type: string
 
 jobs:

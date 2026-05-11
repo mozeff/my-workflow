@@ -10,7 +10,7 @@ on:
       num_links:
         description: 'Number of video links to extract'
         required: true
-        default: 50
+        default: 20
         type: number
 
 jobs:

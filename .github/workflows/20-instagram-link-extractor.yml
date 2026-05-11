@@ -10,7 +10,7 @@ on:
       num_links:
         description: 'Number of post links to extract'
         required: true
-        default: 50
+        default: 10
         type: number
 
 jobs:

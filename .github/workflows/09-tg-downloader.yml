@@ -15,7 +15,7 @@ on:
       split_size:
         description: 'Max part size in MB (no upper limit, but >100MB may require Git LFS to push)'
         required: false
-        default: '80'
+        default: '90'
         type: string
 
 jobs:

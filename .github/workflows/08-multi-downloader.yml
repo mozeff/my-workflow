@@ -36,15 +36,15 @@ on:
           - medium
           - high
       split_size:
-        description: 'Max size per part (MB) - for split mode (default 45)'
+        description: 'Max size per part (MB) - for split mode (default 90)'
         required: false
-        default: '45'
+        default: '90'
         type: string
       take_screenshot:
         description: 'Take a full-page screenshot of each URL?'
         required: false
         type: boolean
-        default: false
+        default: true
       download_images:
         description: 'Download all images found in the page?'
         required: false
@@ -58,7 +58,7 @@ on:
       add_jitter:
         description: 'Add random 0-1 second jitter (sub-second precision)'
         required: false
-        default: false
+        default: true
         type: boolean
       screenshot_delay:
         description: 'Delay before taking screenshot (seconds after page load)'
