@@ -52,7 +52,6 @@ on:
         required: false
         default: '90'
         type: string
-      # ورودی‌های جدید برای پروکسی عمومی
       use_public_proxy:
         description: 'Use a tested working public SOCKS5 proxy as final fallback'
         required: false
