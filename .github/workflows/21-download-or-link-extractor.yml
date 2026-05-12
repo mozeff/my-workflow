@@ -28,10 +28,20 @@ on:
         type: string
         default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
       archive_name:
-        description: 'Base name for RAR archive (download mode, if split)'
+        description: 'Base name for ZIP archive (download mode, if archiving/splitting)'
         required: false
         type: string
         default: 'video'
+      enable_zip:
+        description: 'Enable ZIP archiving for downloaded file (with optional password)'
+        required: false
+        default: true
+        type: boolean
+      zip_password:
+        description: 'Password for ZIP archive of downloaded file (leave empty for no password)'
+        required: false
+        default: ''
+        type: string
 
       # --- Link extraction inputs ---
       platform:
@@ -52,15 +62,24 @@ on:
         required: false
         type: number
         default: 10
+      extract_enable_zip:
+        description: 'Enable ZIP archiving for the extracted links list (with optional password)'
+        required: false
+        default: true
+        type: boolean
+      extract_zip_password:
+        description: 'Password for the links ZIP archive (leave empty for no password)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # optional, for compatibility
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ──────────────────── Download job ────────────────────
   download:
     if: github.event.inputs.mode == 'download'
     runs-on: ubuntu-latest
@@ -139,11 +158,8 @@ jobs:
           echo "filename=$FILENAME" >> $GITHUB_OUTPUT
           echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
 
-      - name: Install RAR
-        run: sudo apt-get install -y rar
-
-      - name: Conditional split (if file > 99 MB)
-        id: split
+      - name: ZIP archiving & splitting (optional password)
+        id: archive
         shell: bash
         run: |
           FOLDER="${{ github.event.inputs.output_folder }}"
@@ -152,22 +168,52 @@ jobs:
           SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
           THRESHOLD_MB=99
 
+          ENABLE_ZIP="${{ github.event.inputs.enable_zip }}"
+          ZIP_PASS="${{ github.event.inputs.zip_password }}"
+
           cd "$FOLDER"
 
-          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
+          if [ "$ENABLE_ZIP" = "true" ]; then
+            echo "ZIP archiving enabled."
 
             RANDOM_HEX=$(openssl rand -hex 3)
-            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
+            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}.zip"
 
-            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
+            if [ -n "$ZIP_PASS" ]; then
+              PASS_ARG="-P ${ZIP_PASS}"
+            else
+              PASS_ARG=""
+            fi
 
-            rm "$FILENAME"
+            if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
+              echo "File > ${THRESHOLD_MB} MB, splitting into 95 MB parts with ZIP..."
+              zip ${PASS_ARG} -s 95m "${ARCHIVE_NAME}" "$FILENAME"
+              rm "$FILENAME"
+              ls -lh ${ARCHIVE_NAME%.zip}.z* 2>/dev/null || ls -lh ${ARCHIVE_NAME}
+            else
+              echo "File <= ${THRESHOLD_MB} MB, creating a single ZIP archive..."
+              zip ${PASS_ARG} "${ARCHIVE_NAME}" "$FILENAME"
+              rm "$FILENAME"
+              ls -lh "${ARCHIVE_NAME}"
+            fi
 
-            echo "split_done=true" >> $GITHUB_OUTPUT
-            ls -lh "${ARCHIVE_NAME}.part"*.rar
+            echo "archive_done=true" >> $GITHUB_OUTPUT
 
           else
-            echo "split_done=false" >> $GITHUB_OUTPUT
+            echo "ZIP archiving disabled."
+
+            if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
+              RANDOM_HEX=$(openssl rand -hex 3)
+              ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}.zip"
+              echo "File > ${THRESHOLD_MB} MB, splitting without password..."
+              zip -s 95m "${ARCHIVE_NAME}" "$FILENAME"
+              rm "$FILENAME"
+              ls -lh ${ARCHIVE_NAME%.zip}.z* 2>/dev/null || ls -lh ${ARCHIVE_NAME}
+            else
+              echo "File size OK, no splitting required."
+            fi
+
+            echo "archive_done=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Commit and push to repository
@@ -201,16 +247,19 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install yt-dlp
-        run: pip install -U yt-dlp
+      - name: Install yt-dlp and zip (just in case)
+        run: |
+          pip install -U yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y zip
 
       - name: Extract links from selected platform
+        id: extract
         run: |
           INPUT="${{ github.event.inputs.tag_or_url }}"
           NUM_LINKS="${{ github.event.inputs.num_links }}"
           PLATFORM="${{ github.event.inputs.platform }}"
 
-          # Construct target URL based on platform
           if [[ "$INPUT" =~ ^https?:// ]]; then
             TARGET_URL="$INPUT"
           else
@@ -220,7 +269,6 @@ jobs:
                 TARGET_URL="https://www.***.com/gifs/tag/${TAG}"
                 ;;
               "****")
-                # Adjust the following URL pattern to match the platform ****
                 TARGET_URL="https://www.****.com/tag/${TAG}"
                 ;;
               *)
@@ -234,7 +282,6 @@ jobs:
           echo "Target URL: ${TARGET_URL}"
           echo "Extracting up to ${NUM_LINKS} links..."
 
-          # Temporary file to collect valid URLs
           TMP_LINKS="/tmp/tmp_links.txt"
           > "$TMP_LINKS"
 
@@ -249,7 +296,7 @@ jobs:
           TOTAL=$(wc -l < "$TMP_LINKS")
           echo "Successfully extracted $TOTAL links."
 
-          # Create summary without details
+          # Create markdown summary
           LINKS_FILE="/tmp/extracted_links.md"
           {
             echo "# Extracted Links Summary"
@@ -262,8 +309,41 @@ jobs:
 
           cat "$LINKS_FILE"
 
+          # Determine final file to push (ZIP or MD)
+          ENABLE_ZIP="${{ github.event.inputs.extract_enable_zip }}"
+          ZIP_PASS="${{ github.event.inputs.extract_zip_password }}"
+
+          if [ "$ENABLE_ZIP" = "true" ]; then
+            echo "ZIP archiving for extracted links enabled."
+            RANDOM_HEX=$(openssl rand -hex 3)
+            ARCHIVE_NAME="/tmp/extracted_links_${RANDOM_HEX}.zip"
+
+            if [ -n "$ZIP_PASS" ]; then
+              zip -P "${ZIP_PASS}" "${ARCHIVE_NAME}" "$LINKS_FILE"
+            else
+              zip "${ARCHIVE_NAME}" "$LINKS_FILE"
+            fi
+
+            FINAL_FILE="$ARCHIVE_NAME"
+            FINAL_FILENAME=$(basename "$FINAL_FILE")
+            echo "zip_created=true" >> $GITHUB_OUTPUT
+            echo "final_filename=$FINAL_FILENAME" >> $GITHUB_OUTPUT
+          else
+            FINAL_FILE="$LINKS_FILE"
+            FINAL_FILENAME="extracted_links.md"
+            echo "zip_created=false" >> $GITHUB_OUTPUT
+            echo "final_filename=$FINAL_FILENAME" >> $GITHUB_OUTPUT
+          fi
+
+          # Save for next steps
+          echo "final_file=$FINAL_FILE" >> $GITHUB_OUTPUT
+
+      - name: Copy final file to lists/
+        run: |
+          FINAL_FILE="${{ steps.extract.outputs.final_file }}"
           mkdir -p lists
-          cp "$LINKS_FILE" lists/extracted_links.md
+          cp "$FINAL_FILE" lists/$(basename "$FINAL_FILE")
+          echo "Copied $(basename "$FINAL_FILE") to lists/"
 
       - name: Commit and push list to repository
         run: |
@@ -276,16 +356,16 @@ jobs:
           git reset --hard origin/"$BRANCH"
 
           mkdir -p lists
-          cp /tmp/extracted_links.md lists/extracted_links.md
+          cp ${{ steps.extract.outputs.final_file }} lists/${{ steps.extract.outputs.final_filename }}
 
-          git add lists/extracted_links.md
+          git add lists/
 
           if git diff --cached --quiet; then
             echo "No changes to push."
             exit 0
           fi
 
-          git commit -m "[Link Extraction] Updated list for ${PLATFORM} [skip ci]"
+          git commit -m "[Link Extraction] $([ "${{ steps.extract.outputs.zip_created }}" = 'true' ] && echo 'Zipped list' || echo 'Updated list') for ${PLATFORM} [skip ci]"
 
           RETRY_MAX=10
           for ((i=1; i<=RETRY_MAX; i++)); do
