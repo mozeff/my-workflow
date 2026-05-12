@@ -6,8 +6,7 @@ It was created with the sole purpose of helping my friends. This project has **n
 
 ## 🚨 Important Notice for Users
 
-> **Warning**
->
+> [!WARNING]
 > This tool is intended to run locally on your own machine only.  
 > - Do **NOT** commit downloaded files or any media files to this repository or your fork.  
 > - Do **NOT** use GitHub Actions to download and store large files on GitHub's infrastructure.
