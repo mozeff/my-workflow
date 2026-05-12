@@ -88,25 +88,7 @@ jobs:
 
           mkdir -p downloads tmp_downloads
 
-          # --- توابع جدید برای نام تصادفی عددی ---
-          generate_random_numeric_name() {
-            local PART1=$(( RANDOM * 32768 + RANDOM ))
-            local PART2=$(( RANDOM * 32768 + RANDOM ))
-            echo "${PART1}${PART2}"
-          }
-
-          get_unique_numeric_folder() {
-            local CANDIDATE
-            while true; do
-              CANDIDATE=$(generate_random_numeric_name)
-              if [ ! -d "$BACKUP_DIR/$CANDIDATE" ] && [ ! -d "downloads/$CANDIDATE" ]; then
-                echo "$CANDIDATE"
-                return
-              fi
-            done
-          }
-          # --- پایان توابع جدید ---
-
+          # --- توابع کمکی ---
           urlencode() {
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
@@ -115,7 +97,7 @@ jobs:
             local FILENAME="$1"
             local ERROR_MSG="$2"
             local URL="$3"
-            local FOLDER_NAME=$(get_unique_numeric_folder)
+            local FOLDER_NAME="error_$(date +%s%N | sha256sum | head -c 12)_${FILENAME}"
             mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
             {
               echo "# ${FILENAME} - Download Failed"
@@ -146,13 +128,14 @@ jobs:
               echo "- Check if the URL is correct and accessible"
               echo "- The file may have been removed or moved"
               echo "- The server may require authentication"
-              echo "- For SourceForge: Try using the direct download link"
+              echo "- Try using the direct download link if possible"
               echo "- Some servers block automated downloads (403 Forbidden)"
-              echo "- Try again later if it is a temporary server issue"
+              echo "- Retry later if it's a temporary issue"
             } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
             echo "Error file created: $BACKUP_DIR/$FOLDER_NAME/README.md"
           }
 
+          # --- تابع دانلود تقویت‌شده با اعتبارسنجی محتوا (روش اول) ---
           download_with_retry() {
             local URL="$1"
             local FILENAME="$2"
@@ -165,7 +148,6 @@ jobs:
 
             for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
               echo "Attempt $attempt of $MAX_RETRIES for $FILENAME"
-              rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
 
               ERROR_LOG=$(aria2c \
                 --split=2 \
@@ -184,17 +166,29 @@ jobs:
                 "$URL" 2>&1)
 
               if [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
-                local FILE_SIZE=$(stat -c%s "tmp_downloads/$FILENAME" 2>/dev/null || echo "0")
-                if [ "$FILE_SIZE" -gt 0 ]; then
+                # اگر فایل دانلود شده HTML باشد (مثلاً صفحه خطا) دوباره تلاش کن
+                if file "tmp_downloads/$FILENAME" | grep -qi 'HTML'; then
+                  echo "Downloaded file appears to be HTML, retrying..."
+                  rm -f "tmp_downloads/$FILENAME"
+                elif [[ "$FILENAME" == *.apk ]]; then
+                  # برای APK چک کن که magic bytes با PK شروع بشه (فایل ZIP)
+                  if head -c 2 "tmp_downloads/$FILENAME" | grep -q 'PK'; then
+                    SUCCESS=true
+                    echo "APK magic check passed, download valid: $FILENAME"
+                    break
+                  else
+                    echo "APK magic check failed, retrying..."
+                    rm -f "tmp_downloads/$FILENAME"
+                  fi
+                else
                   SUCCESS=true
-                  echo "aria2c download successful: $FILENAME (${FILE_SIZE} bytes)"
+                  echo "Download successful: $FILENAME"
                   break
                 fi
               fi
 
-              rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
-              echo "aria2c failed or file empty, trying curl fallback..."
-
+              # Fallback با curl
+              echo "aria2 failed or invalid content, trying curl..."
               ERROR_LOG=$(curl -L -f -# \
                 --retry 3 \
                 --retry-delay 5 \
@@ -205,33 +199,32 @@ jobs:
                 "$URL" 2>&1)
 
               if [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
-                local FILE_SIZE=$(stat -c%s "tmp_downloads/$FILENAME" 2>/dev/null || echo "0")
-                if [ "$FILE_SIZE" -gt 0 ]; then
+                if file "tmp_downloads/$FILENAME" | grep -qi 'HTML'; then
+                  rm -f "tmp_downloads/$FILENAME"
+                elif [[ "$FILENAME" == *.apk ]] && ! head -c 2 "tmp_downloads/$FILENAME" | grep -q 'PK'; then
+                  rm -f "tmp_downloads/$FILENAME"
+                else
                   SUCCESS=true
-                  echo "curl download successful: $FILENAME (${FILE_SIZE} bytes)"
+                  echo "curl download valid: $FILENAME"
                   break
                 fi
               fi
 
               rm -f "tmp_downloads/$FILENAME"
-              echo "Attempt $attempt failed. Waiting ${RETRY_DELAY}s before retry..."
+              echo "Attempt $attempt failed. Waiting ${RETRY_DELAY}s..."
               sleep $RETRY_DELAY
               RETRY_DELAY=$((RETRY_DELAY * 2))
             done
 
             if [ "$SUCCESS" = true ] && [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
-              local FINAL_SIZE=$(stat -c%s "tmp_downloads/$FILENAME" 2>/dev/null || echo "0")
-              if [ "$FINAL_SIZE" -gt 0 ]; then
-                echo "Successfully downloaded: $FILENAME ($FINAL_SIZE bytes)"
-                return 0
-              fi
+              return 0
             fi
 
-            rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
             create_error_file "$FILENAME" "Download failed after $MAX_RETRIES attempts. Last error: $ERROR_LOG" "$URL"
             return 1
           }
 
+          # --- حلقه اصلی دانلود ---
           for URL in $URLS; do
             FILENAME=$(basename "$URL" | sed 's/%20/ /g' | sed 's/%2F/-/g' | sed 's/[?#].*//')
             FILENAME=$(echo "$FILENAME" | sed 's/[<>:"|?*]/_/g')
@@ -239,10 +232,12 @@ jobs:
             download_with_retry "$URL" "$FILENAME" || echo "Failed to download: $FILENAME"
           done
 
+          # --- پردازش فایل‌های دانلود شده ---
           if [ "$MODE" = "zip" ]; then
+            # حالت zip: همه فایل‌ها در یک آرشیو قرار می‌گیرند
             if [ -n "$(ls -A tmp_downloads 2>/dev/null)" ]; then
-              FOLDER_NAME=$(get_unique_numeric_folder)
-              ARCHIVE_NAME="$FOLDER_NAME"
+              FOLDER_NAME="bundle_$(date +%s%N | sha256sum | head -c 12)"
+              ARCHIVE_NAME="${FOLDER_NAME}.zip"
               mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
               echo "Creating zip archive in folder: $BACKUP_DIR/$FOLDER_NAME"
 
@@ -250,61 +245,45 @@ jobs:
               for f in tmp_downloads/*; do
                 if [ -f "$f" ] && [ -s "$f" ]; then
                   VALID_FILES="$VALID_FILES $f"
-                else
-                  echo "Skipping empty or invalid file: $f"
                 fi
               done
 
               if [ -n "$VALID_FILES" ]; then
                 if [ -n "$ZIP_PASSWORD" ]; then
-                  zip -j -P "$ZIP_PASSWORD" "$BACKUP_DIR/$FOLDER_NAME/${ARCHIVE_NAME}.zip" $VALID_FILES
+                  zip -j -P "$ZIP_PASSWORD" "$BACKUP_DIR/$FOLDER_NAME/$ARCHIVE_NAME" $VALID_FILES
                 else
-                  zip -j "$BACKUP_DIR/$FOLDER_NAME/${ARCHIVE_NAME}.zip" $VALID_FILES
+                  zip -j "$BACKUP_DIR/$FOLDER_NAME/$ARCHIVE_NAME" $VALID_FILES
                 fi
 
-                if [ ! -s "$BACKUP_DIR/$FOLDER_NAME/${ARCHIVE_NAME}.zip" ]; then
-                  echo "ERROR: Zip file is empty or not created!"
-                  rm -f "$BACKUP_DIR/$FOLDER_NAME/${ARCHIVE_NAME}.zip"
-                else
-                  ZIP_SIZE=$(stat -c%s "$BACKUP_DIR/$FOLDER_NAME/${ARCHIVE_NAME}.zip")
-                  ZIP_SIZE_MB=$(echo "scale=2; $ZIP_SIZE / 1024 / 1024" | bc)
-                  FOLDER_ENCODED=$(urlencode "${FOLDER_NAME}")
-                  FILE_ENCODED=$(urlencode "${ARCHIVE_NAME}.zip")
-                  RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${FILE_ENCODED}"
+                ZIP_SIZE=$(stat -c%s "$BACKUP_DIR/$FOLDER_NAME/$ARCHIVE_NAME")
+                ZIP_SIZE_MB=$(echo "scale=2; $ZIP_SIZE / 1024 / 1024" | bc)
+                FOLDER_ENCODED=$(urlencode "${FOLDER_NAME}")
+                FILE_ENCODED=$(urlencode "${ARCHIVE_NAME}")
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${FILE_ENCODED}"
 
-                  {
-                    echo "# ${ARCHIVE_NAME} Archive"
-                    echo ""
-                    echo "---"
-                    echo ""
-                    echo "## Download Information"
-                    echo ""
-                    echo "| Property | Value |"
-                    echo "|----------|-------|"
-                    echo "| **Archive Name** | \`${ARCHIVE_NAME}.zip\` |"
-                    echo "| **Size** | ${ZIP_SIZE_MB} MB |"
-                    echo "| **Status** | **Complete (100%)** |"
-                    if [ -n "$ZIP_PASSWORD" ]; then
-                      echo "| **Password Protected** | **YES** |"
-                    else
-                      echo "| **Password Protected** | **NO** |"
-                    fi
-                    echo ""
-                    echo "---"
-                    echo ""
-                    echo "## Download Link"
-                    echo ""
-                    echo "| File | Link |"
-                    echo "|------|------|"
-                    echo "| \`${ARCHIVE_NAME}.zip\` | [Download](${RAW_LINK}) |"
-                  } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
-                fi
-              else
-                echo "No valid files to archive!"
+                {
+                  echo "# Combined Archive"
+                  echo ""
+                  echo "| Property | Value |"
+                  echo "|----------|-------|"
+                  echo "| **Archive Name** | \`${ARCHIVE_NAME}\` |"
+                  echo "| **Size** | ${ZIP_SIZE_MB} MB |"
+                  if [ -n "$ZIP_PASSWORD" ]; then
+                    echo "| **Password Protected** | **YES** |"
+                  fi
+                  echo ""
+                  echo "## Download Link"
+                  echo ""
+                  echo "| File | Link |"
+                  echo "|------|------|"
+                  echo "| \`${ARCHIVE_NAME}\` | [Download](${RAW_LINK}) |"
+                } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
               fi
             fi
             rm -rf tmp_downloads
+
           else
+            # حالت normal: هر فایل جداگانه ذخیره می‌شود
             for FILE in tmp_downloads/*; do
               [ -f "$FILE" ] || continue
               if [ ! -s "$FILE" ]; then
@@ -314,22 +293,18 @@ jobs:
               fi
 
               SIZE=$(stat -c%s "$FILE")
-              if [ "$SIZE" -le 0 ]; then
-                echo "WARNING: File has zero or invalid size: $FILE"
-                rm -f "$FILE"
-                continue
-              fi
-
               BASENAME=$(basename "$FILE")
-              FOLDER_NAME=$(get_unique_numeric_folder)
+              # نام پوشه: یکتا + نام فایل برای تشخیص راحت
+              FOLDER_NAME="file_$(date +%s%N | sha256sum | head -c 12)_${BASENAME}"
               mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
 
               FOLDER_ENCODED=$(urlencode "${FOLDER_NAME}")
 
+              # اگر فایل بزرگتر از حد تقسیم باشد → اسپلیت
               if [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
                 echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB - splitting into ${SPLIT_THRESHOLD_MB}MB parts"
 
-                TEMP_NAME="file_$$"
+                TEMP_NAME="split_$$"
                 cp "$FILE" "tmp_downloads/${TEMP_NAME}.${BASENAME##*.}"
 
                 cd tmp_downloads
@@ -342,31 +317,15 @@ jobs:
                 for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
                   if [ -f "$part" ] && [ -s "$part" ]; then
                     PART_EXT="${part##*.}"
-                    mv "$part" "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.${PART_EXT}"
-                    echo "  Created: ${FOLDER_NAME}.${PART_EXT}"
+                    mv "$part" "$BACKUP_DIR/${FOLDER_NAME}/${BASENAME}.${PART_EXT}"
+                    echo "  Created: ${BASENAME}.${PART_EXT}"
                   fi
                 done
-
                 rm -f "${TEMP_NAME}.${BASENAME##*.}"
                 cd ..
 
+                # ساخت README برای اسپلیت
                 PARTS_COUNT=$(ls "$BACKUP_DIR/${FOLDER_NAME}/"*.z* 2>/dev/null | wc -l)
-                echo "Parts created in folder $BACKUP_DIR/$FOLDER_NAME: $PARTS_COUNT files"
-
-                if [ "$PARTS_COUNT" -eq 0 ]; then
-                  echo "ERROR: No zip parts were created for $BASENAME"
-                  continue
-                fi
-
-                TOTAL_SIZE=0
-                for part_file in "$BACKUP_DIR/${FOLDER_NAME}"/*; do
-                  if [ -f "$part_file" ]; then
-                    PART_SIZE=$(stat -c%s "$part_file" 2>/dev/null || echo 0)
-                    TOTAL_SIZE=$((TOTAL_SIZE + PART_SIZE))
-                  fi
-                done
-                TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
-
                 DOWNLOAD_LINKS_MD=""
                 LINK_NUM=0
                 for part_file in "$BACKUP_DIR/${FOLDER_NAME}/"*.z*; do
@@ -379,92 +338,53 @@ jobs:
                   fi
                 done
 
-                README_FILE="$BACKUP_DIR/${FOLDER_NAME}/README.md"
                 {
-                  printf '%s\n' "# ${FOLDER_NAME} (orig: ${BASENAME})"
-                  printf '%s\n' ""
-                  printf '%s\n' "---"
-                  printf '%s\n' ""
-                  printf '%s\n' "## Download Information"
-                  printf '%s\n' ""
-                  printf '%s\n' "| Property | Value |"
-                  printf '%s\n' "|----------|-------|"
-                  printf '%s\n' "| **Original File** | \`${BASENAME}\` |"
-                  printf '%s\n' "| **Total Size** | **${PARTS_COUNT} zip parts** - **${TOTAL_SIZE_MB} MB** |"
-                  printf '%s\n' "| **Status** | **Complete (100%)** |"
+                  echo "# ${BASENAME} (split parts)"
+                  echo ""
+                  echo "| Property | Value |"
+                  echo "|----------|-------|"
+                  echo "| **Original File** | \`${BASENAME}\` |"
+                  echo "| **Parts** | ${PARTS_COUNT} |"
                   if [ -n "$ZIP_PASSWORD" ]; then
-                    printf '%s\n' "| **Password Protected** | **YES** |"
-                  else
-                    printf '%s\n' "| **Password Protected** | **NO** |"
+                    echo "| **Password Protected** | **YES** |"
                   fi
-                  printf '%s\n' ""
-                  printf '%s\n' "---"
-                  printf '%s\n' ""
-                  printf '%s\n' "## Download Links"
-                  printf '%s\n' ""
-                  printf '%s\n' "| # | File | Link |"
-                  printf '%s\n' "|---|------|------|"
+                  echo ""
+                  echo "## Download Links"
+                  echo ""
+                  echo "| # | File | Link |"
+                  echo "|---|------|------|"
                   printf '%s' "${DOWNLOAD_LINKS_MD}"
-                  printf '%s\n' ""
-                  printf '%s\n' "---"
-                  printf '%s\n' ""
-                  printf '%s\n' "## How to Extract"
-                  printf '%s\n' ""
-                  printf '%s\n' "1. **Download** all \`.zip\` and \`.z01\`, \`.z02\`... files"
-                  printf '%s\n' "2. **Extract** using [7-Zip](https://www.7-zip.org/) or [WinRAR](https://www.rarlab.com/)"
-                  printf '%s\n' "3. Open the \`.zip\` file - all parts will combine automatically"
-                } > "$README_FILE"
-
-                echo "Created README.md for split archive"
+                  echo ""
+                  echo "## How to Extract"
+                  echo ""
+                  echo "1. Download all parts"
+                  echo "2. Extract with 7-Zip or WinRAR"
+                } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
 
               else
-                echo "$BASENAME - creating zip in folder: $BACKUP_DIR/$FOLDER_NAME"
-
-                if [ -n "$ZIP_PASSWORD" ]; then
-                  zip -j -P "$ZIP_PASSWORD" "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.zip" "$FILE"
-                else
-                  zip -j "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.zip" "$FILE"
-                fi
-
-                if [ ! -s "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.zip" ]; then
-                  echo "ERROR: Failed to create zip for $BASENAME"
-                  rm -f "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.zip"
-                  continue
-                fi
-
-                SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
-                FILE_ENCODED=$(urlencode "${FOLDER_NAME}.zip")
+                # فایل کوچک: مستقیم کپی کن (بدون zip اضافی)
+                cp "$FILE" "$BACKUP_DIR/$FOLDER_NAME/$BASENAME"
+                FILE_ENCODED=$(urlencode "$BASENAME")
                 RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${FILE_ENCODED}"
 
-                README_FILE="$BACKUP_DIR/${FOLDER_NAME}/README.md"
+                SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
                 {
-                  printf '%s\n' "# ${FOLDER_NAME} (orig: ${BASENAME})"
-                  printf '%s\n' ""
-                  printf '%s\n' "---"
-                  printf '%s\n' ""
-                  printf '%s\n' "## Download Information"
-                  printf '%s\n' ""
-                  printf '%s\n' "| Property | Value |"
-                  printf '%s\n' "|----------|-------|"
-                  printf '%s\n' "| **Original File** | \`${BASENAME}\` |"
-                  printf '%s\n' "| **Size** | ${SIZE_MB} MB |"
-                  printf '%s\n' "| **Status** | **Complete (100%)** |"
+                  echo "# ${BASENAME}"
+                  echo ""
+                  echo "| Property | Value |"
+                  echo "|----------|-------|"
+                  echo "| **File** | \`${BASENAME}\` |"
+                  echo "| **Size** | ${SIZE_MB} MB |"
                   if [ -n "$ZIP_PASSWORD" ]; then
-                    printf '%s\n' "| **Password Protected** | **YES** |"
-                  else
-                    printf '%s\n' "| **Password Protected** | **NO** |"
+                    echo "| **Password Protected** | **YES** (applied to split files only) |"
                   fi
-                  printf '%s\n' ""
-                  printf '%s\n' "---"
-                  printf '%s\n' ""
-                  printf '%s\n' "## Download Link"
-                  printf '%s\n' ""
-                  printf '%s\n' "| File | Link |"
-                  printf '%s\n' "|------|------|"
-                  printf '%s\n' "| \`${FOLDER_NAME}.zip\` | [Download](${RAW_LINK}) |"
-                } > "$README_FILE"
-
-                echo "Created zip and README.md"
+                  echo ""
+                  echo "## Download Link"
+                  echo ""
+                  echo "| File | Link |"
+                  echo "|------|------|"
+                  echo "| \`${BASENAME}\` | [Download](${RAW_LINK}) |"
+                } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
               fi
             done
             rm -rf tmp_downloads

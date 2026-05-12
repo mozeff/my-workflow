@@ -1,4 +1,4 @@
-name: 🎬 06-YouTube Downloader3
+name: 🎬 06-YouTube Downloader3 (Integrated API for 720/1080)
 
 on:
   workflow_dispatch:
@@ -203,10 +203,91 @@ jobs:
           export PATH="$DENO_INSTALL/bin:$PATH"
           echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
           deno --version
-          pip3 install --upgrade yt-dlp
+          pip3 install --upgrade yt-dlp requests   # ⭐ requests اضافه شد
+
+      # ⭐ مرحله جدید: دانلود از طریق API برای کیفیت‌های ۷۲۰ و ۱۰۸۰
+      - name: Download via API (720p/1080p)
+        id: api_download
+        if: ${{ (github.event.inputs.quality == '720' || github.event.inputs.quality == '1080') && github.event.inputs.audio_only != 'true' }}
+        run: |
+          mkdir -p api_downloads
+          python3 << 'PYEOF'
+          import os, sys, time, re, requests
+
+          URL  = os.environ['INPUT_URL']
+          QUAL = os.environ['INPUT_QUALITY']   # e.g., '720' or '1080'
+          QUAL_API = f"{QUAL}p"                # API expects '720p' or '1080p'
+
+          payload = {
+              "url": URL,
+              "os": "linux",
+              "output": {
+                  "type": "video",
+                  "format": "mp4",
+                  "quality": QUAL_API
+              }
+          }
+
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+          s.get("https://media.ytmp3.gg/")
+
+          resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+          resp.raise_for_status()
+          data = resp.json()
+
+          status_url = data.get('statusUrl')
+          title = data.get('title', 'video')
+
+          dl_url = None
+          for _ in range(150):   # 5 دقیقه انتظار
+              time.sleep(2)
+              r = s.get(status_url, timeout=20)
+              status = r.json()
+              if status.get('status') == 'completed':
+                  dl_url = status.get('downloadUrl')
+                  break
+              if status.get('status') == 'failed':
+                  print("::error::API server failed to prepare the video")
+                  sys.exit(1)
+
+          if not dl_url:
+              print("::error::Could not get download link from API")
+              sys.exit(1)
+
+          vid   = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)[1]
+          clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+          clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
+          clean = clean.lstrip('-')
+          fname = f"{clean}_{vid}_{QUAL_API}.mp4"
+
+          # ذخیره اطلاعات برای مراحل بعدی
+          with open("api_downloads/.info", "w") as f:
+              f.write(f"{dl_url}\n{fname}\n{title}")
+          PYEOF
+
+          # دانلود واقعی فایل
+          DL_URL=$(head -1 api_downloads/.info)
+          FILENAME=$(sed -n '2p' api_downloads/.info)
+          echo "Downloading via API: $FILENAME"
+          curl -L --fail --progress-bar -o "api_downloads/$FILENAME" "$DL_URL"
+
+          if [ -s "api_downloads/$FILENAME" ]; then
+            echo "api_success=true" >> $GITHUB_OUTPUT
+            echo "api_file=$(realpath api_downloads/$FILENAME)" >> $GITHUB_OUTPUT
+            echo "API download succeeded."
+          else
+            echo "::warning::API download failed, falling back to yt-dlp"
+            echo "api_success=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          INPUT_URL: ${{ github.event.inputs.youtube_url }}
+          INPUT_QUALITY: ${{ github.event.inputs.quality }}
 
       - name: Pre-check available video qualities
         id: quality_check
+        # این مرحله فقط برای yt‑dlp لازم است، بنابراین وقتی API استفاده می‌شود اجرا نمی‌شود
+        if: ${{ steps.api_download.outputs.api_success != 'true' }}
         run: |
           set -euo pipefail
           URL="${{ github.event.inputs.youtube_url }}"
@@ -288,6 +369,10 @@ jobs:
           USE_PUBLIC_PROXY="${{ steps.public_proxy.outputs.proxy_available }}"
           PUBLIC_PROXY="${{ steps.public_proxy.outputs.proxy_address }}"
 
+          # ⭐ خروجی‌های مرحله API
+          API_SUCCESS="${{ steps.api_download.outputs.api_success }}"
+          API_FILE="${{ steps.api_download.outputs.api_file }}"
+
           if ! [[ "$SPLIT_SIZE_INPUT" =~ ^[0-9]+$ ]] || [ "$SPLIT_SIZE_INPUT" -le 0 ]; then
             echo "Invalid split size, using default 90"
             SPLIT_SIZE_INPUT=90
@@ -316,123 +401,159 @@ jobs:
             [ "$USE_COOKIES" = "true" ] && echo "WARNING: use_cookies is ON but secret is empty."
           fi
 
-          echo "Downloading: $URL (Audio=$AUDIO_ONLY, Quality=$QUALITY, Cookies=$COOKIES_STATUS, Strict=$STRICT, Split size=${SPLIT_SIZE_INPUT}MB)"
-
-          sanitize_name() { echo "$1" | sed 's/ /-/g; s/　/-/g' | tr -s '-'; }
-          urlencode() { python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
-
-          if [ "$AUDIO_ONLY" = "true" ]; then
-            DOWNLOAD_TYPE="audio"
-          else
+          # ⭐ اگر API فایل را با موفقیت دانلود کرده باشد، مستقیم استفاده کن
+          if [ "$API_SUCCESS" = "true" ] && [ -f "$API_FILE" ]; then
+            echo "✅ Using file from API: $API_FILE"
+            cp "$API_FILE" "tmp_downloads/$(basename "$API_FILE")"
             DOWNLOAD_TYPE="video"
-          fi
-
-          # Build FORMAT string (unchanged)
-          if [ "$AUDIO_ONLY" = "true" ]; then
-            FORMAT="bestaudio/best"
+            QUALITY_MISMATCH=false
+            ACTUAL_QUALITY_DESC=""
+            MISMATCH_REASON=""
+            BEST_HEIGHT=$QUALITY
+            # کیفیت را دقیقاً برابر درخواستی در نظر بگیر
+            echo "API download was successful, skipping yt-dlp methods."
           else
-            if [ "$USE_EXACT" = "true" ] && [ "$QUALITY" != "best" ]; then
-              case "$QUALITY" in
-                144)  FORMAT="bestvideo[height=144]+bestaudio/best[height=144]" ;;
-                240)  FORMAT="bestvideo[height=240]+bestaudio/best[height=240]" ;;
-                360)  FORMAT="bestvideo[height=360]+bestaudio/best[height=360]" ;;
-                480)  FORMAT="bestvideo[height=480]+bestaudio/best[height=480]" ;;
-                720)  FORMAT="bestvideo[height=720]+bestaudio/best[height=720]" ;;
-                1080) FORMAT="bestvideo[height=1080]+bestaudio/best[height=1080]" ;;
-                1440) FORMAT="bestvideo[height=1440]+bestaudio/best[height=1440]" ;;
-                2160) FORMAT="bestvideo[height=2160]+bestaudio/best[height=2160]" ;;
-                *)    echo "Unknown quality"; exit 1 ;;
-              esac
+            # ⭐⭐⭐ بلوک اصلی yt‑dlp (بدون تغییر) ⭐⭐⭐
+            echo "Downloading: $URL (Audio=$AUDIO_ONLY, Quality=$QUALITY, Cookies=$COOKIES_STATUS, Strict=$STRICT, Split size=${SPLIT_SIZE_INPUT}MB)"
+
+            sanitize_name() { echo "$1" | sed 's/ /-/g; s/　/-/g' | tr -s '-'; }
+            urlencode() { python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
+
+            if [ "$AUDIO_ONLY" = "true" ]; then
+              DOWNLOAD_TYPE="audio"
             else
-              if [ "$STRICT" = "true" ] && [ "$USE_EXACT" = "false" ]; then
-                echo "🚫 Strict mode: quality ${QUALITY}p not available. Aborting."
-                exit 1
-              fi
-              case "$QUALITY" in
-                144)  FORMAT="bestvideo[height<=144]+bestaudio/best[height<=144]/best" ;;
-                240)  FORMAT="bestvideo[height<=240]+bestaudio/best[height<=240]/best" ;;
-                360)  FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]/best" ;;
-                480)  FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]/best" ;;
-                720)  FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]/best" ;;
-                1080) FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]/best" ;;
-                1440) FORMAT="bestvideo[height<=1440]+bestaudio/best[height<=1440]/best" ;;
-                2160) FORMAT="bestvideo[height<=2160]+bestaudio/best[height<=2160]/best" ;;
-                best)  FORMAT="bestvideo+bestaudio/best" ;;
-                *)     echo "Unknown quality"; exit 1 ;;
-              esac
+              DOWNLOAD_TYPE="video"
             fi
-          fi
 
-          # ⭐ پرچم‌های معمولی (بدون thumbnail)
-          COMMON_FLAGS=(--output "tmp_downloads/%(title)s.%(ext)s" --no-part --no-playlist --retries 10 --fragment-retries 10 --no-check-certificates)
+            # ساخت رشته فرمت (بدون تغییر)
+            if [ "$AUDIO_ONLY" = "true" ]; then
+              FORMAT="bestaudio/best"
+            else
+              if [ "$USE_EXACT" = "true" ] && [ "$QUALITY" != "best" ]; then
+                case "$QUALITY" in
+                  144)  FORMAT="bestvideo[height=144]+bestaudio/best[height=144]" ;;
+                  240)  FORMAT="bestvideo[height=240]+bestaudio/best[height=240]" ;;
+                  360)  FORMAT="bestvideo[height=360]+bestaudio/best[height=360]" ;;
+                  480)  FORMAT="bestvideo[height=480]+bestaudio/best[height=480]" ;;
+                  720)  FORMAT="bestvideo[height=720]+bestaudio/best[height=720]" ;;
+                  1080) FORMAT="bestvideo[height=1080]+bestaudio/best[height=1080]" ;;
+                  1440) FORMAT="bestvideo[height=1440]+bestaudio/best[height=1440]" ;;
+                  2160) FORMAT="bestvideo[height=2160]+bestaudio/best[height=2160]" ;;
+                  *)    echo "Unknown quality"; exit 1 ;;
+                esac
+              else
+                if [ "$STRICT" = "true" ] && [ "$USE_EXACT" = "false" ]; then
+                  echo "🚫 Strict mode: quality ${QUALITY}p not available. Aborting."
+                  exit 1
+                fi
+                case "$QUALITY" in
+                  144)  FORMAT="bestvideo[height<=144]+bestaudio/best[height<=144]/best" ;;
+                  240)  FORMAT="bestvideo[height<=240]+bestaudio/best[height<=240]/best" ;;
+                  360)  FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]/best" ;;
+                  480)  FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]/best" ;;
+                  720)  FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]/best" ;;
+                  1080) FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]/best" ;;
+                  1440) FORMAT="bestvideo[height<=1440]+bestaudio/best[height<=1440]/best" ;;
+                  2160) FORMAT="bestvideo[height<=2160]+bestaudio/best[height<=2160]/best" ;;
+                  best)  FORMAT="bestvideo+bestaudio/best" ;;
+                  *)     echo "Unknown quality"; exit 1 ;;
+                esac
+              fi
+            fi
 
-          get_method_args() {
-            local meth="$1"
-            args=()
-            local POT_ARG="--extractor-args"
-            local POT_VALUE="youtube:pot-provider=http://127.0.0.1:4416"
-            case "$meth" in
-              1)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9") ;;
-              2)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=mweb" "--concurrent-fragments" "4") ;;
-              3)  args+=("--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9") ;;
-              4)  args+=("--extractor-args" "youtube:player_client=mweb" "--concurrent-fragments" "4") ;;
-              5)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=web,mweb" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9" "--concurrent-fragments" "4") ;;
-              6)  args+=("--extractor-args" "youtube:player_client=android" "--user-agent" "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" "--concurrent-fragments" "4") ;;
-              7)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=android" "--user-agent" "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" "--concurrent-fragments" "4") ;;
-              8)  args+=("--extractor-args" "youtube:player_client=web,mweb" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9" "--concurrent-fragments" "4") ;;
-              9)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=ios" "--user-agent" "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1" "--concurrent-fragments" "4") ;;
-              10) args+=("--extractor-args" "youtube:player_client=ios" "--concurrent-fragments" "4") ;;
-              *)   echo "Unknown method $meth"; exit 1 ;;
-            esac
-            args+=("$POT_ARG" "$POT_VALUE")
-          }
+            COMMON_FLAGS=(--output "tmp_downloads/%(title)s.%(ext)s" --no-part --no-playlist --retries 10 --fragment-retries 10 --no-check-certificates)
 
-          DOWNLOAD_SUCCESS=false
-          TOTAL_METHODS=10
-          BEST_HEIGHT=0
+            get_method_args() {
+              local meth="$1"
+              args=()
+              local POT_ARG="--extractor-args"
+              local POT_VALUE="youtube:pot-provider=http://127.0.0.1:4416"
+              case "$meth" in
+                1)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9") ;;
+                2)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=mweb" "--concurrent-fragments" "4") ;;
+                3)  args+=("--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9") ;;
+                4)  args+=("--extractor-args" "youtube:player_client=mweb" "--concurrent-fragments" "4") ;;
+                5)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=web,mweb" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9" "--concurrent-fragments" "4") ;;
+                6)  args+=("--extractor-args" "youtube:player_client=android" "--user-agent" "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" "--concurrent-fragments" "4") ;;
+                7)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=android" "--user-agent" "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" "--concurrent-fragments" "4") ;;
+                8)  args+=("--extractor-args" "youtube:player_client=web,mweb" "--js-runtimes" "deno" "--user-agent" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "--add-header" "Accept-Language:en-US,en;q=0.9" "--concurrent-fragments" "4") ;;
+                9)  args+=("--proxy" "socks5://127.0.0.1:1080" "--extractor-args" "youtube:player_client=ios" "--user-agent" "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1" "--concurrent-fragments" "4") ;;
+                10) args+=("--extractor-args" "youtube:player_client=ios" "--concurrent-fragments" "4") ;;
+                *)   echo "Unknown method $meth"; exit 1 ;;
+              esac
+              args+=("$POT_ARG" "$POT_VALUE")
+            }
 
-          for (( meth=1; meth<=TOTAL_METHODS; meth++ )); do
-            echo "Trying method $meth/$TOTAL_METHODS..."
-            get_method_args $meth
-            set +e
-            yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} "${args[@]}" "$URL" 2>&1 | tee -a "$YT_LOG"
-            YT_EXIT=${PIPESTATUS[0]}
-            set -e
+            DOWNLOAD_SUCCESS=false
+            TOTAL_METHODS=10
+            BEST_HEIGHT=0
 
-            if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
-              DOWNLOAD_SUCCESS=true
-              echo "Success with method $meth (exit=$YT_EXIT)"
-              if [ "$AUDIO_ONLY" != "true" ] && [ "$QUALITY" != "best" ]; then
-                VIDEO_FILE=$(find tmp_downloads -type f ! -name "*.part" -size +0 2>/dev/null | head -1)
-                if [ -n "$VIDEO_FILE" ]; then
-                  HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VIDEO_FILE" 2>/dev/null | head -1)
-                  if [ -n "$HEIGHT" ] && [ "$HEIGHT" -ge 0 ] 2>/dev/null; then
-                    BEST_HEIGHT=$HEIGHT
-                    if [ "$HEIGHT" -ge "$QUALITY" ]; then
-                      echo "✅ Achieved ${HEIGHT}p (desired ${QUALITY}p). Stopping."
-                      break
-                    else
-                      echo "⚠️ Got ${HEIGHT}p, need ${QUALITY}p. Trying next method..."
-                      rm -rf tmp_downloads/*
-                      DOWNLOAD_SUCCESS=false
+            for (( meth=1; meth<=TOTAL_METHODS; meth++ )); do
+              echo "Trying method $meth/$TOTAL_METHODS..."
+              get_method_args $meth
+              set +e
+              yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} "${args[@]}" "$URL" 2>&1 | tee -a "$YT_LOG"
+              YT_EXIT=${PIPESTATUS[0]}
+              set -e
+
+              if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
+                DOWNLOAD_SUCCESS=true
+                echo "Success with method $meth (exit=$YT_EXIT)"
+                if [ "$AUDIO_ONLY" != "true" ] && [ "$QUALITY" != "best" ]; then
+                  VIDEO_FILE=$(find tmp_downloads -type f ! -name "*.part" -size +0 2>/dev/null | head -1)
+                  if [ -n "$VIDEO_FILE" ]; then
+                    HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VIDEO_FILE" 2>/dev/null | head -1)
+                    if [ -n "$HEIGHT" ] && [ "$HEIGHT" -ge 0 ] 2>/dev/null; then
+                      BEST_HEIGHT=$HEIGHT
+                      if [ "$HEIGHT" -ge "$QUALITY" ]; then
+                        echo "✅ Achieved ${HEIGHT}p (desired ${QUALITY}p). Stopping."
+                        break
+                      else
+                        echo "⚠️ Got ${HEIGHT}p, need ${QUALITY}p. Trying next method..."
+                        rm -rf tmp_downloads/*
+                        DOWNLOAD_SUCCESS=false
+                      fi
                     fi
                   fi
+                else
+                  break
                 fi
               else
-                break
+                echo "Method $meth failed, waiting..."
+                sleep $((RANDOM % 10 + 5))
+                find tmp_downloads -name "*.part" -delete 2>/dev/null || true
               fi
-            else
-              echo "Method $meth failed, waiting..."
-              sleep $((RANDOM % 10 + 5))
-              find tmp_downloads -name "*.part" -delete 2>/dev/null || true
-            fi
-          done
+            done
 
-          if ! $DOWNLOAD_SUCCESS; then
-            if [ -z "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
-              echo "No file yet, trying final fallback with web,mweb..."
+            if ! $DOWNLOAD_SUCCESS; then
+              if [ -z "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
+                echo "No file yet, trying final fallback with web,mweb..."
+                set +e
+                yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} \
+                  --extractor-args "youtube:player_client=web,mweb;pot-provider=http://127.0.0.1:4416" \
+                  --js-runtimes deno \
+                  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+                  --add-header "Accept-Language:en-US,en;q=0.9" \
+                  --concurrent-fragments 4 \
+                  "$URL" 2>&1 | tee -a "$YT_LOG"
+                YT_EXIT=${PIPESTATUS[0]}
+                set -e
+                if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
+                  DOWNLOAD_SUCCESS=true
+                  echo "Fallback succeeded."
+                fi
+              else
+                DOWNLOAD_SUCCESS=true
+                echo "Accepting previously downloaded lower quality file."
+              fi
+            fi
+
+            # آخرین راه حل: پروکسی عمومی
+            if ! $DOWNLOAD_SUCCESS && [ "$USE_PUBLIC_PROXY" = "true" ] && [ -n "$PUBLIC_PROXY" ]; then
+              echo "⚠️ WARP methods exhausted. Trying public proxy $PUBLIC_PROXY ..."
               set +e
               yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} \
+                --proxy "socks5://$PUBLIC_PROXY" \
                 --extractor-args "youtube:player_client=web,mweb;pot-provider=http://127.0.0.1:4416" \
                 --js-runtimes deno \
                 --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
@@ -443,43 +564,57 @@ jobs:
               set -e
               if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
                 DOWNLOAD_SUCCESS=true
-                echo "Fallback succeeded."
+                echo "✅ Public proxy download succeeded!"
+              else
+                echo "❌ Public proxy also failed."
               fi
-            else
-              DOWNLOAD_SUCCESS=true
-              echo "Accepting previously downloaded lower quality file."
             fi
-          fi
 
-          # ⭐ آخرین راه حل: پروکسی عمومی
-          if ! $DOWNLOAD_SUCCESS && [ "$USE_PUBLIC_PROXY" = "true" ] && [ -n "$PUBLIC_PROXY" ]; then
-            echo "⚠️ WARP methods exhausted. Trying public proxy $PUBLIC_PROXY ..."
-            set +e
-            yt-dlp --format "$FORMAT" "${COMMON_FLAGS[@]}" ${COOKIES_FLAG} \
-              --proxy "socks5://$PUBLIC_PROXY" \
-              --extractor-args "youtube:player_client=web,mweb;pot-provider=http://127.0.0.1:4416" \
-              --js-runtimes deno \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-              --add-header "Accept-Language:en-US,en;q=0.9" \
-              --concurrent-fragments 4 \
-              "$URL" 2>&1 | tee -a "$YT_LOG"
-            YT_EXIT=${PIPESTATUS[0]}
-            set -e
-            if [ $YT_EXIT -eq 0 ] || [ -n "$(find tmp_downloads -type f ! -name '*.part' -size +0 2>/dev/null)" ]; then
-              DOWNLOAD_SUCCESS=true
-              echo "✅ Public proxy download succeeded!"
-            else
-              echo "❌ Public proxy also failed."
+            if ! $DOWNLOAD_SUCCESS; then
+              echo "All methods failed!"
+              exit 1
             fi
+
+            # تعیین دلیل عدم تطابق کیفیت (برای yt‑dlp)
+            MISMATCH_REASON=""
+            if grep -qi "SABR-only\|missing a URL\|SABR" "$YT_LOG"; then
+              MISMATCH_REASON="YouTube SABR experiment limited available formats."
+            elif grep -qi "sign in to confirm your age\|age.restricted\|age restricted" "$YT_LOG"; then
+              MISMATCH_REASON="Video is age-restricted; login required for full quality."
+            elif grep -qi "HTTP Error 403\|Forbidden" "$YT_LOG"; then
+              MISMATCH_REASON="Access denied (403 Forbidden); possibly geo-restricted or bot detection."
+            elif grep -qi "This video is private\|Video unavailable" "$YT_LOG"; then
+              MISMATCH_REASON="Video may be private or unavailable in your region."
+            else
+              MISMATCH_REASON="YouTube served a lower quality format (possible A/B testing or regional restrictions)."
+            fi
+
+            QUALITY_MISMATCH=false
+            ACTUAL_QUALITY_DESC=""
+            if [ "$AUDIO_ONLY" != "true" ] && [ "$QUALITY" != "best" ]; then
+              VIDEO_FILE=$(find tmp_downloads -type f ! -name "*.part" -size +0 2>/dev/null | head -1)
+              if [ -n "$VIDEO_FILE" ]; then
+                HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VIDEO_FILE" 2>/dev/null | head -1)
+                if [ -n "$HEIGHT" ] && [ "$HEIGHT" -ge 0 ] 2>/dev/null; then
+                  if [ "$HEIGHT" -lt "$QUALITY" ]; then
+                    QUALITY_MISMATCH=true
+                    ACTUAL_QUALITY_DESC="${HEIGHT}p"
+                    echo "⚠️ Quality mismatch: Requested ${QUALITY}p but got ${HEIGHT}p"
+                    echo "Reason: $MISMATCH_REASON"
+                  else
+                    ACTUAL_QUALITY_DESC="${HEIGHT}p"
+                    echo "✅ Quality OK: ${HEIGHT}p"
+                  fi
+                fi
+              fi
+            fi
+            # پایان بلوک yt‑dlp
           fi
 
-          if ! $DOWNLOAD_SUCCESS; then
-            echo "All methods failed!"
-            exit 1
-          fi
-
+          # ⭐ پاکسازی فایل‌های ناقص
           find tmp_downloads -name "*.part" -delete
 
+          # ⭐ اعتبارسنجی فایل‌های دانلود شده (مشترک)
           echo "::group::Validating downloaded file(s)"
           for FILE in tmp_downloads/*; do
             [ -f "$FILE" ] || continue
@@ -491,39 +626,6 @@ jobs:
             fi
           done
           echo "::endgroup::"
-
-          MISMATCH_REASON=""
-          if grep -qi "SABR-only\|missing a URL\|SABR" "$YT_LOG"; then
-            MISMATCH_REASON="YouTube SABR experiment limited available formats."
-          elif grep -qi "sign in to confirm your age\|age.restricted\|age restricted" "$YT_LOG"; then
-            MISMATCH_REASON="Video is age-restricted; login required for full quality."
-          elif grep -qi "HTTP Error 403\|Forbidden" "$YT_LOG"; then
-            MISMATCH_REASON="Access denied (403 Forbidden); possibly geo-restricted or bot detection."
-          elif grep -qi "This video is private\|Video unavailable" "$YT_LOG"; then
-            MISMATCH_REASON="Video may be private or unavailable in your region."
-          else
-            MISMATCH_REASON="YouTube served a lower quality format (possible A/B testing or regional restrictions)."
-          fi
-
-          QUALITY_MISMATCH=false
-          ACTUAL_QUALITY_DESC=""
-          if [ "$AUDIO_ONLY" != "true" ] && [ "$QUALITY" != "best" ]; then
-            VIDEO_FILE=$(find tmp_downloads -type f ! -name "*.part" -size +0 2>/dev/null | head -1)
-            if [ -n "$VIDEO_FILE" ]; then
-              HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VIDEO_FILE" 2>/dev/null | head -1)
-              if [ -n "$HEIGHT" ] && [ "$HEIGHT" -ge 0 ] 2>/dev/null; then
-                if [ "$HEIGHT" -lt "$QUALITY" ]; then
-                  QUALITY_MISMATCH=true
-                  ACTUAL_QUALITY_DESC="${HEIGHT}p"
-                  echo "⚠️ Quality mismatch: Requested ${QUALITY}p but got ${HEIGHT}p"
-                  echo "Reason: $MISMATCH_REASON"
-                else
-                  ACTUAL_QUALITY_DESC="${HEIGHT}p"
-                  echo "✅ Quality OK: ${HEIGHT}p"
-                fi
-              fi
-            fi
-          fi
 
           echo "Download complete:"
           ls -la tmp_downloads/
@@ -547,6 +649,7 @@ jobs:
 
           > /tmp/video_info.txt
 
+          # ⭐ ساخت آرشیو و README (مشترک برای هر دو روش)
           for FILE in tmp_downloads/*; do
             [ -f "$FILE" ] || continue
 
@@ -554,6 +657,8 @@ jobs:
             BASENAME=$(basename "$FILE")
             FILENAME_NO_EXT="${BASENAME%.*}"
             EXT="${BASENAME##*.}"
+            # sanitize_name باید تعریف شده باشد (در بلوک yt‑dlp تعریف شده، در API هم نیاز داریم)
+            sanitize_name() { echo "$1" | sed 's/ /-/g; s/　/-/g' | tr -s '-'; }
             FILENAME_NO_EXT=$(sanitize_name "$FILENAME_NO_EXT")
             echo "Processing: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
 
@@ -665,7 +770,6 @@ jobs:
                 "${EXTRACT_GUIDE_LINE3}" \
                 > "$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
             fi
-            # دیگر thumbnail اضافه نمی‌شود.
           done
 
           rm -rf tmp_downloads
